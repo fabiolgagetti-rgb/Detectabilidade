@@ -19,9 +19,10 @@ public class ESFValidation {
         // RMSE_align: so a fidelidade de forma/intensidade, apos remover o
         //             deslocamento lateral.
         // Offset_px:  vies de posicionamento da borda (detectada vs analitica).
-        // FailReasons: quebra das falhas por motivo (ver EdgeDiagnostics).
+        // FailReasons : motivo por que cada RECORD foi descartado no Segmenter.
+        // StageReasons: em que ETAPA cada MEDIÇÃO falhou (Segmenter vs TTF/ESF vs métrica).
         EdgeDiagnostics.enable();
-        System.out.println("Kernel\tNoise(SD)\tRMSE_raw(HU)\tBias_raw(HU)\tRMSE_align(HU)\tOffset(px)\tFalhas\tFailReasons");
+        System.out.println("Kernel\tNoise(SD)\tRMSE_raw(HU)\tBias_raw(HU)\tRMSE_align(HU)\tOffset(px)\tFalhas\tFailReasons\tStageReasons");
 
         int nSlicesHomogeneo = 0;
         int nSlicesInserts = 1;
@@ -103,28 +104,46 @@ public class ESFValidation {
                         
                         DetectorResult dR = Segmenter.edgeFinder(imp.getStack(), cal, userRoi, false, true);
                         if (dR == null) {
+                            EdgeDiagnostics.recordStage(EdgeDiagnostics.Stage.SEG_NO_RESULT);
                             failures++; i--; continue;
+                        }
+                        if (dR.rois == null || dR.rois.isEmpty()
+                                || dR.rois.get(0) == null || dR.rois.get(0).isEmpty()) {
+                            EdgeDiagnostics.recordStage(EdgeDiagnostics.Stage.SEG_NO_RESULT);
+                            failures++; continue;
                         }
                         
                         mtfResult mtfRes = TtfCalc.analisarStackComInserts(imp.getStack(), cal, dR, fftPoints);
                         if (mtfRes == null || mtfRes.esfs == null || mtfRes.esfs.isEmpty()) {
+                            EdgeDiagnostics.recordStage(EdgeDiagnostics.Stage.TTF_NULL_OR_EMPTY);
                             failures++; continue;
                         }
 
                         double[] measuredEsf = mtfRes.esfs.values().iterator().next();
+                        if (measuredEsf == null || measuredEsf.length == 0) {
+                            EdgeDiagnostics.recordStage(EdgeDiagnostics.Stage.TTF_NULL_OR_EMPTY);
+                            failures++; continue;
+                        }
+                        if (!isFinite(measuredEsf)) {
+                            EdgeDiagnostics.recordStage(EdgeDiagnostics.Stage.TTF_NONFINITE);
+                            failures++; continue;
+                        }
                         
                         // Validar a ESF medida contra a ESF matemática absoluta
                         double[] metrics = calcularErroESF(measuredEsf, esfIdeal);
                         if (!Double.isNaN(metrics[0])) {
+                            EdgeDiagnostics.recordStage(EdgeDiagnostics.Stage.OK);
                             rmseList.add(metrics[0]);      // RMSE_raw
                             biasList.add(metrics[1]);      // Bias_raw
                             if (!Double.isNaN(metrics[2])) rmseAlignList.add(metrics[2]); // RMSE_align
                             if (!Double.isNaN(metrics[3])) offsetList.add(metrics[3]);    // Offset_px
                         } else {
+                            EdgeDiagnostics.recordStage(EdgeDiagnostics.Stage.METRIC_NAN);
                             failures++;
                         }
                         
                     } catch (Exception e) {
+                        EdgeDiagnostics.recordStage(EdgeDiagnostics.Stage.TTF_NONFINITE);
                         failures++;
                     }
                 }
@@ -133,9 +152,9 @@ public class ESFValidation {
                 double meanBias = calculateMean(biasList);
                 double meanRmseAlign = calculateMean(rmseAlignList);
                 double meanOffset = calculateMean(offsetList);
-                System.out.printf("%s\t%d\t%.4f\t%.4f\t%.4f\t%.4f\t%d\t%s\n",
+                System.out.printf("%s\t%d\t%.4f\t%.4f\t%.4f\t%.4f\t%d\t%s\t%s\n",
                         kernel, sd, meanRmse, meanBias, meanRmseAlign, meanOffset,
-                        failures, EdgeDiagnostics.summary());
+                        failures, EdgeDiagnostics.summary(), EdgeDiagnostics.stageSummary());
             }
         }
     }
@@ -310,5 +329,11 @@ public class ESFValidation {
         double sum = 0;
         for (double v : values) sum += v;
         return sum / values.size();
+    }
+
+    /** true se todos os elementos sao finitos (sem NaN/Inf). */
+    private static boolean isFinite(double[] a) {
+        for (double v : a) if (!Double.isFinite(v)) return false;
+        return true;
     }
 }

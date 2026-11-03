@@ -30,8 +30,25 @@ public final class EdgeDiagnostics {
         CONTRAST_GATE          // expected contrast empty or < 5 HU
     }
 
+    /**
+     * Why a whole MEASUREMENT (one phantom realization) failed in a validation
+     * harness. Records failures that happen AFTER Segmenter.processRecord --
+     * i.e. in the TTF/ESF stage -- which the per-record Reason above cannot see.
+     * This is what resolves the apparent paradox "ACCEPTED=30 and Falhas=30":
+     * the Segmenter accepted the record, but the downstream TTF/ESF step failed.
+     */
+    public enum Stage {
+        OK,                    // measurement produced a usable metric
+        SEG_NO_RESULT,         // edgeFinder returned null / no ROI
+        TTF_NULL_OR_EMPTY,     // analisarStackComInserts gave null or empty ttfs/esfs
+        TTF_F0_NONPOS,         // TTF normalization constant f0 (DC) <= 0
+        TTF_NONFINITE,         // measured TTF/ESF contained NaN or Inf
+        METRIC_NAN             // PE / RMSE came back NaN (e.g. sumModel==0)
+    }
+
     private static boolean enabled = false;
     private static final Map<Reason, Integer> counts = new EnumMap<>(Reason.class);
+    private static final Map<Stage, Integer> stageCounts = new EnumMap<>(Stage.class);
     private static Reason lastReason = null;
 
     private EdgeDiagnostics() {}
@@ -42,6 +59,7 @@ public final class EdgeDiagnostics {
 
     public static synchronized void reset() {
         counts.clear();
+        stageCounts.clear();
         lastReason = null;
     }
 
@@ -62,7 +80,17 @@ public final class EdgeDiagnostics {
         return counts.getOrDefault(r, 0);
     }
 
-    /** One-line summary of all non-zero reason counts, e.g. "BCV_GATE=18 LOW_CIRCULARITY=4". */
+    /** Record a per-measurement stage outcome (harness-side). No-op unless enabled. */
+    public static synchronized void recordStage(Stage s) {
+        if (!enabled) return;
+        stageCounts.merge(s, 1, Integer::sum);
+    }
+
+    public static synchronized int count(Stage s) {
+        return stageCounts.getOrDefault(s, 0);
+    }
+
+    /** One-line summary of all non-zero per-record reason counts. */
     public static synchronized String summary() {
         StringBuilder sb = new StringBuilder();
         for (Reason r : Reason.values()) {
@@ -70,6 +98,19 @@ public final class EdgeDiagnostics {
             if (c > 0) {
                 if (sb.length() > 0) sb.append(' ');
                 sb.append(r).append('=').append(c);
+            }
+        }
+        return sb.length() == 0 ? "(none)" : sb.toString();
+    }
+
+    /** One-line summary of all non-zero per-measurement stage counts. */
+    public static synchronized String stageSummary() {
+        StringBuilder sb = new StringBuilder();
+        for (Stage s : Stage.values()) {
+            int c = stageCounts.getOrDefault(s, 0);
+            if (c > 0) {
+                if (sb.length() > 0) sb.append(' ');
+                sb.append(s).append('=').append(c);
             }
         }
         return sb.length() == 0 ? "(none)" : sb.toString();
