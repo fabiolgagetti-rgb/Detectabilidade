@@ -210,6 +210,7 @@ public class Segmenter {
         double thresholdForEdge = (stats.histMin + temp * stats.binSize + stats.binSize / 2.0);
 
         if (bcv < 3000) {
+            EdgeDiagnostics.record(EdgeDiagnostics.Reason.BCV_GATE);
             return;
         }
 
@@ -245,6 +246,7 @@ public class Segmenter {
             }
         }
         if (!found) {
+            EdgeDiagnostics.record(EdgeDiagnostics.Reason.WAND_NOT_FOUND);
             return;
         }
 
@@ -256,6 +258,7 @@ public class Segmenter {
             }
         }
         if (!touchesOriginalRoi) {
+            EdgeDiagnostics.record(EdgeDiagnostics.Reason.WAND_OFF_ROI);
             return;
         }
 
@@ -263,6 +266,7 @@ public class Segmenter {
 
         Rectangle bounds = wandRoi.getBounds();
         if(bounds.x <= 0 || bounds.y <= 0 || bounds.x + bounds.width >= imgWidth || bounds.y + bounds.height >= imgHeight) {
+             EdgeDiagnostics.record(EdgeDiagnostics.Reason.BOUNDS_TOUCH_IMAGE);
              return;
         }
         double sumX = 0, sumY = 0;
@@ -399,6 +403,7 @@ public class Segmenter {
         }
         double circularity = getCircularity(finalSubpixelPolygon);
         if (circularity < 0.3) {
+            EdgeDiagnostics.record(EdgeDiagnostics.Reason.LOW_CIRCULARITY);
             return;
         }
 
@@ -477,7 +482,12 @@ public class Segmenter {
              }
         }
 
-        if (expectedContrasts.isEmpty() || expectedContrasts.get(0) < 5) return;
+        if (expectedContrasts.isEmpty() || expectedContrasts.get(0) < 5) {
+            EdgeDiagnostics.record(EdgeDiagnostics.Reason.CONTRAST_GATE);
+            return;
+        }
+
+        EdgeDiagnostics.record(EdgeDiagnostics.Reason.ACCEPTED);
 
         dR.modeContrast.add(expectedContrasts);
         dR.meanI0.add(expectedI0);

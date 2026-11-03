@@ -13,7 +13,8 @@ public class TtfValidation {
 
     public static void main(String[] args) {
     	
-    	System.out.println("Kernel\tNoise(SD)\tMean_PEttf(%)\tSD_PEttf(%)\tFalhas");
+    	EdgeDiagnostics.enable();
+    	System.out.println("Kernel\tNoise(SD)\tMean_PEttf(%)\tSD_PEttf(%)\tFalhas\tFailReasons");
 
         int nSlicesHomogeneo = 0;
         int nSlicesInserts = 1;
@@ -78,7 +79,9 @@ public class TtfValidation {
                 
                 List<Double> peList = new ArrayList<>();
                 int failures = 0;
-                
+
+                EdgeDiagnostics.reset();
+
                 for (int i = 0; i < numMeasurements; i++) {
                     try {
                         PhantomImageCreator creator = new PhantomImageCreator();
@@ -130,7 +133,8 @@ public class TtfValidation {
                 }
                 double stdPE = peList.isEmpty() ? 0 : Math.sqrt(sumSq / peList.size());
                 
-                System.out.printf("%s\t%d\t%.4f\t%.4f\t%d\n", kernel, sd, meanPE, stdPE, failures);
+                System.out.printf("%s\t%d\t%.4f\t%.4f\t%d\t%s\n",
+                        kernel, sd, meanPE, stdPE, failures, EdgeDiagnostics.summary());
             }
         }
     }
