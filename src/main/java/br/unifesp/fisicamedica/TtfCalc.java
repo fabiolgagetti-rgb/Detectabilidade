@@ -207,7 +207,7 @@ public class TtfCalc {
             for (int j = -half; j <= half; j++) {
                 double x = x0 + j * step * nx;
                 double y = y0 + j * step * ny;
-                double val =  ip.getBicubicInterpolatedPixel(x, y, ip);
+                double val = getLanczosInterpolatedPixel(ip, x, y);
                 profile[j + half] = cal.getCValue(val);
             }
             
