@@ -125,49 +125,59 @@ public class ESFValidation {
     }
 
     /**
-     * Extrai a ESF de referência matematicamente perfeita isolando a coluna central 
-     * (amostragem bruta) e aplicando interpolação linear estritamente em 1D 
-     * para evitar a suavização cruzada da interpolação bilinear 2D.
+     * ESF de referência (ground truth).
+     *
+     * IMPORTANTE: para que o erro medido (measured - ideal) reflita apenas o
+     * efeito de ruido + detector, a ESF ideal precisa ser amostrada com a MESMA
+     * geometria e o MESMO kernel de interpolacao que a ESF medida em
+     * TtfCalc.calculateESF. Antes isso nao acontecia:
+     *   - a medida anda ao longo da NORMAL local e usa interpolacao Lanczos-3;
+     *   - a ideal andava so no eixo Y e usava interpolacao linear 1D.
+     * Essa diferenca de metodo (Lanczos vs linear; normal vs eixo Y) contaminava
+     * o RMSE/Bias com "mismatch de metodo", nao com erro de deteccao.
+     *
+     * Aqui a borda esta as "12 horas" de um circulo centrado em (centroPx,
+     * centroPx), entao a normal e exatamente vertical. Amostramos ao longo de Y
+     * com passo 0.5 px, ancorados na borda analitica edgeY = centroPx - raioPx,
+     * usando o MESMO Lanczos-3 de TtfCalc (getLanczosInterpolatedPixel). A
+     * imagem passada deve ser a versao SEM ruido (MTF aplicada) -- essa e a ESF
+     * verdadeira borrada pelo kernel.
+     *
+     * Convencao de indice identica a calculateESF: indice 0 = fundo (fora do
+     * inserto, Y menor), ultimo indice = objeto (dentro, Y maior).
      */
     private static double[] gerarEsfIdealDireta(ImageProcessor ip, double centroPx, double raioPx, int profileLength, Calibration cal) {
         int half = profileLength / 2;
-        double step = 0.5; // Espaçamento subpixel do TtfCalc
+        double step = 0.5; // mesmo passo subpixel do TtfCalc
         double[] esf = new double[profileLength];
 
-        // Isola a coluna central exata (amostragem bruta em X)
-        int x = (int) Math.round(centroPx);
-        
-        // A borda "12 horas" fica em y = centro - raio (lembrando que Y cresce para baixo)
-        double edgeY = centroPx - raioPx;
+        // Coluna central (12 horas). A normal aponta de fora (Y menor) para
+        // dentro (Y maior), i.e. (nx, ny) = (0, +1).
+        double x0 = centroPx;
+        double edgeY = centroPx - raioPx;   // borda analitica
 
         for (int j = -half; j <= half; j++) {
-            // j negativo -> dentro do inserto (y maior, voltando pro centro)
-            // j positivo -> fora do inserto (y menor, subindo na tela)
-            double sampleY = edgeY + (j * step);
-            
-            // 1. Amostragem bruta na coluna isolada (Sem interferência 2D)
-            int y0 = (int) Math.floor(sampleY);
-            int y1 = y0 + 1;
-            
-            // Limites de segurança da matriz
-            if (y0 < 0) y0 = 0; 
-            if (y0 >= ip.getHeight()) y0 = ip.getHeight() - 1;
-            if (y1 < 0) y1 = 0; 
-            if (y1 >= ip.getHeight()) y1 = ip.getHeight() - 1;
-            
-            double val0 = ip.getf(x, y0);
-            double val1 = ip.getf(x, y1);
-            
-            // 2. Interpolação linear puramente 1D no eixo Y
-            double dy = sampleY - Math.floor(sampleY); // Parte fracionária
-            double pixelValue = val0 * (1.0 - dy) + val1 * dy;
-            
+            double x = x0;
+            double y = edgeY + (j * step);  // normal vertical, mesmo sentido da medida
+
+            // Mesmo kernel de interpolacao da ESF medida (Lanczos-3).
+            double pixelValue = TtfCalc.getLanczosInterpolatedPixel(ip, x, y);
             esf[j + half] = cal.getCValue(pixelValue);
         }
-        
+
         return esf;
     }
 
+    /**
+     * NOTA (registro/registration): a ESF medida e ancorada nos pontos de borda
+     * DETECTADOS, enquanto a ideal e ancorada na borda ANALITICA
+     * (centroPx - raioPx). Um deslocamento subpixel entre as duas ancoras
+     * aparece como BIAS em HU, amplificado pela inclinacao da ESF. Portanto o
+     * campo Bias_ESF mede, em parte, erro de REGISTRO e nao so erro de
+     * intensidade. Para isolar a fidelidade de forma da ESF, considere alinhar
+     * measured e ideal pelo ponto de 50% (ou pelo pico da correlacao cruzada)
+     * antes de calcular o RMSE, e reportar o offset de alinhamento separadamente.
+     */
     private static double[] calcularErroESF(double[] measured, double[] ideal) {
         if (measured.length != ideal.length) return new double[]{Double.NaN, Double.NaN};
         
