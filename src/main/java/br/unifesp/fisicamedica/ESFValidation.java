@@ -19,7 +19,9 @@ public class ESFValidation {
         // RMSE_align: so a fidelidade de forma/intensidade, apos remover o
         //             deslocamento lateral.
         // Offset_px:  vies de posicionamento da borda (detectada vs analitica).
-        System.out.println("Kernel\tNoise(SD)\tRMSE_raw(HU)\tBias_raw(HU)\tRMSE_align(HU)\tOffset(px)\tFalhas");
+        // FailReasons: quebra das falhas por motivo (ver EdgeDiagnostics).
+        EdgeDiagnostics.enable();
+        System.out.println("Kernel\tNoise(SD)\tRMSE_raw(HU)\tBias_raw(HU)\tRMSE_align(HU)\tOffset(px)\tFalhas\tFailReasons");
 
         int nSlicesHomogeneo = 0;
         int nSlicesInserts = 1;
@@ -87,7 +89,9 @@ public class ESFValidation {
                 List<Double> rmseAlignList = new ArrayList<>();
                 List<Double> offsetList = new ArrayList<>();
                 int failures = 0;
-                
+
+                EdgeDiagnostics.reset();  // zera a contagem de motivos para esta condicao
+
                 for (int i = 0; i < numMeasurements; i++) {
                     try {
                         PhantomImageCreator creator = new PhantomImageCreator();
@@ -129,8 +133,9 @@ public class ESFValidation {
                 double meanBias = calculateMean(biasList);
                 double meanRmseAlign = calculateMean(rmseAlignList);
                 double meanOffset = calculateMean(offsetList);
-                System.out.printf("%s\t%d\t%.4f\t%.4f\t%.4f\t%.4f\t%d\n",
-                        kernel, sd, meanRmse, meanBias, meanRmseAlign, meanOffset, failures);
+                System.out.printf("%s\t%d\t%.4f\t%.4f\t%.4f\t%.4f\t%d\t%s\n",
+                        kernel, sd, meanRmse, meanBias, meanRmseAlign, meanOffset,
+                        failures, EdgeDiagnostics.summary());
             }
         }
     }
