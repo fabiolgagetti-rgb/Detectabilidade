@@ -15,7 +15,11 @@ public class ESFValidation {
 
     public static void main(String[] args) {
         
-        System.out.println("Kernel\tNoise(SD)\tRMSE_ESF(HU)\tBias_ESF(HU)\tFalhas");
+        // RMSE_raw/Bias_raw: sem alinhar (contem o erro de registro).
+        // RMSE_align: so a fidelidade de forma/intensidade, apos remover o
+        //             deslocamento lateral.
+        // Offset_px:  vies de posicionamento da borda (detectada vs analitica).
+        System.out.println("Kernel\tNoise(SD)\tRMSE_raw(HU)\tBias_raw(HU)\tRMSE_align(HU)\tOffset(px)\tFalhas");
 
         int nSlicesHomogeneo = 0;
         int nSlicesInserts = 1;
@@ -80,6 +84,8 @@ public class ESFValidation {
                 
                 List<Double> rmseList = new ArrayList<>();
                 List<Double> biasList = new ArrayList<>();
+                List<Double> rmseAlignList = new ArrayList<>();
+                List<Double> offsetList = new ArrayList<>();
                 int failures = 0;
                 
                 for (int i = 0; i < numMeasurements; i++) {
@@ -106,8 +112,10 @@ public class ESFValidation {
                         // Validar a ESF medida contra a ESF matemática absoluta
                         double[] metrics = calcularErroESF(measuredEsf, esfIdeal);
                         if (!Double.isNaN(metrics[0])) {
-                            rmseList.add(metrics[0]); // RMSE
-                            biasList.add(metrics[1]); // BIAS
+                            rmseList.add(metrics[0]);      // RMSE_raw
+                            biasList.add(metrics[1]);      // Bias_raw
+                            if (!Double.isNaN(metrics[2])) rmseAlignList.add(metrics[2]); // RMSE_align
+                            if (!Double.isNaN(metrics[3])) offsetList.add(metrics[3]);    // Offset_px
                         } else {
                             failures++;
                         }
@@ -119,7 +127,10 @@ public class ESFValidation {
                 
                 double meanRmse = calculateMean(rmseList);
                 double meanBias = calculateMean(biasList);
-                System.out.printf("%s\t%d\t%.4f\t%.4f\t%d\n", kernel, sd, meanRmse, meanBias, failures);
+                double meanRmseAlign = calculateMean(rmseAlignList);
+                double meanOffset = calculateMean(offsetList);
+                System.out.printf("%s\t%d\t%.4f\t%.4f\t%.4f\t%.4f\t%d\n",
+                        kernel, sd, meanRmse, meanBias, meanRmseAlign, meanOffset, failures);
             }
         }
     }
@@ -169,32 +180,124 @@ public class ESFValidation {
     }
 
     /**
-     * NOTA (registro/registration): a ESF medida e ancorada nos pontos de borda
-     * DETECTADOS, enquanto a ideal e ancorada na borda ANALITICA
-     * (centroPx - raioPx). Um deslocamento subpixel entre as duas ancoras
-     * aparece como BIAS em HU, amplificado pela inclinacao da ESF. Portanto o
-     * campo Bias_ESF mede, em parte, erro de REGISTRO e nao so erro de
-     * intensidade. Para isolar a fidelidade de forma da ESF, considere alinhar
-     * measured e ideal pelo ponto de 50% (ou pelo pico da correlacao cruzada)
-     * antes de calcular o RMSE, e reportar o offset de alinhamento separadamente.
+     * Erros da ESF, separando REGISTRO de FIDELIDADE DE FORMA.
+     *
+     * Por que alinhar? A ESF ideal e ancorada na borda ANALITICA (passo j=0 cai
+     * exatamente na borda verdadeira), entao seu ponto de 50% fica no indice
+     * central. Ja a ESF medida e ancorada no ponto de borda DETECTADO
+     * (TtfCalc usa x0,y0 do poligono). O detector e subpixel mas tem um
+     * deslocamento residual -- em parte aleatorio (RMS ~0.06..0.5 px) e em parte
+     * SISTEMATICO (o pre-blur Gaussiano empurra a borda de um circulo levemente
+     * para dentro; restauracao/cleanWand/snap de 3px tambem deslocam). Logo o
+     * ponto de 50% da ESF medida NAO cai no indice central: ele fica deslocado
+     * pelo erro de posicionamento da borda.
+     *
+     * Num trecho ingreme a ESF muda ~40-50 HU por passo de 0.5 px, entao um
+     * deslocamento de 0.2 px vira dezenas de HU de erro aparente, com sinal
+     * consistente -> infla RMSE e, principalmente, o Bias, sem que as
+     * INTENSIDADES reconstruidas estejam erradas.
+     *
+     * Solucao: medir o offset entre as duas curvas pelo cruzamento de 50% do
+     * contraste, alinhar a medida (reamostrando com o MESMO Lanczos-3) e so
+     * entao calcular o RMSE. Reportamos:
+     *   [0] rmseRaw   - RMSE sem alinhar (como antes)
+     *   [1] biasRaw   - Bias sem alinhar (como antes)
+     *   [2] rmseAlign - RMSE depois de remover o deslocamento lateral
+     *                   (fidelidade de FORMA/intensidade, ~independente da
+     *                    posicao da borda)
+     *   [3] offsetPx  - deslocamento de registro em pixels (positivo = borda
+     *                   detectada deslocada no sentido +indice em relacao a
+     *                   analitica); mede o VIES DE POSICIONAMENTO do detector.
      */
     private static double[] calcularErroESF(double[] measured, double[] ideal) {
-        if (measured.length != ideal.length) return new double[]{Double.NaN, Double.NaN};
-        
-        double sumSqError = 0.0;
-        double sumBias = 0.0;
+        if (measured.length != ideal.length)
+            return new double[]{Double.NaN, Double.NaN, Double.NaN, Double.NaN};
+
         int n = measured.length;
-        
+        double step = 0.5; // px por amostra, igual ao TtfCalc
+
+        // --- metricas cruas (sem alinhar) ---
+        double sumSq = 0.0, sumBias = 0.0;
         for (int i = 0; i < n; i++) {
-            double error = measured[i] - ideal[i];
-            sumBias += error;
-            sumSqError += (error * error);
+            double e = measured[i] - ideal[i];
+            sumBias += e;
+            sumSq += e * e;
         }
-        
-        double rmse = Math.sqrt(sumSqError / n);
-        double bias = sumBias / n;
-        
-        return new double[]{rmse, bias};
+        double rmseRaw = Math.sqrt(sumSq / n);
+        double biasRaw = sumBias / n;
+
+        // --- offset de registro pelo cruzamento de 50% do contraste ---
+        double idxMeas = halfRiseIndex(measured);
+        double idxIdeal = halfRiseIndex(ideal);
+        double rmseAlign = Double.NaN, offsetPx = Double.NaN;
+        if (!Double.isNaN(idxMeas) && !Double.isNaN(idxIdeal)) {
+            double shift = idxMeas - idxIdeal;          // em amostras (passos)
+            offsetPx = shift * step;                    // em pixels
+
+            // Reamostra a medida deslocada de -shift para casar com a ideal,
+            // usando Lanczos-3 (mesmo kernel da ESF). Compara apenas a regiao
+            // interior valida (margem = raio do Lanczos) para evitar borda.
+            int a = 3;
+            double sq = 0; int cnt = 0;
+            for (int i = 0; i < n; i++) {
+                double src = i + shift;                 // posicao na medida que corresponde ao indice i da ideal
+                if (src < a || src > n - 1 - a) continue; // fora do suporte seguro do kernel
+                double m = lanczosResample(measured, src, a);
+                double e = m - ideal[i];
+                sq += e * e; cnt++;
+            }
+            if (cnt > 0) rmseAlign = Math.sqrt(sq / cnt);
+        }
+
+        return new double[]{rmseRaw, biasRaw, rmseAlign, offsetPx};
+    }
+
+    /**
+     * Indice fracionario onde a ESF cruza 50% entre seu nivel de fundo (media
+     * dos 3 primeiros pontos) e de objeto (media dos 3 ultimos). Interpolacao
+     * linear entre as duas amostras que cercam o cruzamento. Robusto para ESF
+     * monotonica (SOFT) e tambem para a nao-monotonica do Lung, pois usa o
+     * primeiro cruzamento do nivel medio na subida.
+     */
+    private static double halfRiseIndex(double[] esf) {
+        int n = esf.length;
+        if (n < 7) return Double.NaN;
+        double bg = (esf[0] + esf[1] + esf[2]) / 3.0;
+        double obj = (esf[n - 1] + esf[n - 2] + esf[n - 3]) / 3.0;
+        double mid = 0.5 * (bg + obj);
+        boolean rising = obj >= bg;
+        for (int i = 0; i < n - 1; i++) {
+            double a = esf[i], b = esf[i + 1];
+            boolean crosses = rising ? (a <= mid && b >= mid) : (a >= mid && b <= mid);
+            if (crosses) {
+                double denom = (b - a);
+                double frac = denom != 0 ? (mid - a) / denom : 0.0;
+                return i + frac;
+            }
+        }
+        return Double.NaN;
+    }
+
+    /** Reamostragem Lanczos-3 de um sinal 1D numa posicao fracionaria. */
+    private static double lanczosResample(double[] s, double pos, int a) {
+        int n = s.length;
+        int base = (int) Math.floor(pos);
+        double sum = 0, w = 0;
+        for (int k = base - a + 1; k <= base + a; k++) {
+            int idx = Math.max(0, Math.min(n - 1, k));
+            double d = pos - k;
+            double wt = lanczos1d(d, a);
+            sum += s[idx] * wt;
+            w += wt;
+        }
+        return w != 0 ? sum / w : 0;
+    }
+
+    private static double lanczos1d(double x, int a) {
+        if (x == 0.0) return 1.0;
+        if (Math.abs(x) >= a) return 0.0;
+        double piX = Math.PI * x;
+        return (a * Math.sin(piX) * Math.sin(piX / a)) / (piX * piX);
     }
 
     private static double calculateMean(List<Double> values) {
