@@ -430,6 +430,21 @@ public class TtfCalc {
      * Nyquist (ttf.deconvFmaxLpMm, default = 1/(2*pixelWidth)); above that the TTF
      * is left unchanged. This keeps the correction confined to the band where the
      * factors stay comfortably away from their zeros.
+     *
+     * RESIDUAL (Problem A, part 2 - NOT a chain transfer function):
+     * After this deconvolution a small, near-FLAT ~1-3% deficit remains across
+     * the low/mid band. It is NOT frequency-dependent, so no transfer-function
+     * division removes it. It is an inherent finite-support DFT effect in
+     * calculateTtf(): the DC bin (mtf[0] = sum of the LSF) captures the FULL
+     * edge step including the far tails, but the higher-frequency bins are
+     * computed from the TRUNCATED LSF (finite profile length), which omits the
+     * tail area. So mtf[k]/mtf[0] sits slightly below the true continuous MTF.
+     * The deficit shrinks monotonically as the LSF support grows (measured on an
+     * ideal Lung LSF: ~2.6% at +/-4.9 mm half-width, ~1.3% at +/-9.8 mm, ~0.6%
+     * at +/-24 mm), i.e. it halves roughly each time the support doubles. The
+     * only lever is a longer ESF profile, traded off against noise and ROI
+     * geometry; the current +/-10 mm profile keeps it to ~1-3%, acceptable for
+     * the intended use. Left uncorrected by design.
      */
     static void deconvolveChain(double[] mtf, double[] frequency, double pixelWidthMm, double dxMm) {
         double maxGain = 1.0;
