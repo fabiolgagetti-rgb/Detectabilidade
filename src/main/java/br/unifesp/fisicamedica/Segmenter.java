@@ -323,17 +323,24 @@ public class Segmenter {
         // Gradient threshold, replacing the old 0.5*|mode - thresholdForEdge|.
         //
         // The detector thresholds the magnitude of a central difference of the
-        // smoothed image. The crucial constraint is that the threshold must stay
-        // BELOW the true edge gradient (~contrast/3) at all CNR, otherwise it
-        // wipes out detection on low-contrast / low-CNR edges (contrast ~ 100,
-        // noise > 20). A noise-only threshold does not scale with contrast and
-        // fails there. So:
-        //   - rise with noise (0.9*noise) with a contrast floor (0.12*contrast),
-        //   - but cap at 0.6*(contrast/3) so the real edge is never swallowed.
-        double edgeGrad = contrast / 3.0;
+        // smoothed image. The threshold must stay BELOW the true edge gradient
+        // at all CNR (otherwise it wipes out detection on low-contrast edges),
+        // while rising enough with noise to reject texture.
+        //
+        // Previously the cap was 0.6*(contrast/3), modelling the edge gradient as
+        // ~contrast/3. That model is wrong for CT: measured on MTF/NPS phantoms
+        // (SOFT and Lung, Bujila 2017 coefficients) the true peak edge gradient
+        // is ~contrast..3*contrast (SOFT ~304, Lung ~574 for contrast 100 due to
+        // edge enhancement), i.e. ~10-17x larger. The contrast/3 cap therefore
+        // forced the threshold BELOW the noise floor at high noise, admitting
+        // stray noise edges (worst on SOFT at high SD). Capping at 0.5*contrast
+        // tracks the real edge gradient: it stays well below the true edge while
+        // still bounding the threshold, halves stray edges at high SD on SOFT,
+        // and is neutral for Lung. Detection at low contrast/high noise is kept
+        // alive by the single 0.6x fallback below.
         double gradThreshold = Math.min(
                 Math.max(0.9 * noise, 0.12 * contrast),
-                0.6 * edgeGrad);
+                0.5 * contrast);
 
         // Restoration iterations reduced 10 -> 3 (convergence; avoids over-sharpening
         // blurred/soft-kernel edges). The 30x threshold-lowering loop is replaced by
