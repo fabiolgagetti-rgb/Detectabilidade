@@ -147,7 +147,15 @@ public class TtfCalc {
             for (int i1 = 0; i1 < length; i1++) {
                 frequency[i1] = (fNyquist * i1) / (length - 1);
             }
-            
+
+            // Problem A: optional measurement-chain deconvolution (opt-in via
+            // -Dttf.deconv=true). Divides out the analytic finite-difference and
+            // Lanczos transfer functions. See deconvolveChain() for the math and
+            // the guard that prevents high-frequency noise amplification.
+            if (Boolean.getBoolean("ttf.deconv")) {
+                deconvolveChain(mtf, frequency, cal.pixelWidth, dx_mm);
+            }
+
             int insertId = i;
             
             result.esfs.put(insertId, avgEsf);
@@ -391,6 +399,88 @@ public class TtfCalc {
         }
         
         return mtfSum;
+    }
+
+    /**
+     * Problem A: deconvolve the analytic measurement-chain transfer functions
+     * from a DC-normalized measured TTF, in place.
+     *
+     * The measured, DC-normalized TTF relates to the true (DC-normalized) MTF by
+     *     MTF_meas(f) = MTF_true(f) * H_diff(f) * H_lanczos(f)
+     * with both factors equal to 1 at f=0, so the normalization cancels and the
+     * unbiased estimate is the pointwise division
+     *     MTF_true(f) = MTF_meas(f) / (H_diff(f) * H_lanczos(f)).
+     *
+     * (A) H_diff: the LSF is the first difference esf[i+1]-esf[i] at spacing
+     *     dx_mm. Relative to the ideal derivative its magnitude gain is the
+     *     normalized sinc
+     *         H_diff(f) = sin(pi*f*dx) / (pi*f*dx).
+     *
+     * (B) H_lanczos: the ESF is sampled by Lanczos-3 interpolation on the pixel
+     *     grid (kernel L_a(t)=a*sin(pi t)sin(pi t/a)/(pi t)^2, a=3, t in pixels).
+     *     H_lanczos is the continuous Fourier transform of L_a evaluated at
+     *     nu=f*pixelWidth (cycles/pixel), normalized to H_lanczos(0)=1. It is a
+     *     touch above 1 at low/mid frequency and rolls off toward pixel Nyquist.
+     *     Computed once by numerical quadrature and sampled per frequency.
+     *
+     * SAFETY: a pure division amplifies by 1/(H_diff*H_lanczos), which grows
+     * large toward pixel Nyquist (the product falls well below 1 there). To avoid
+     * amplifying noise and ringing past the reliable band, the correction gain is
+     * capped (ttf.deconvMaxGain, default 1.3) and only applied up to the pixel
+     * Nyquist (ttf.deconvFmaxLpMm, default = 1/(2*pixelWidth)); above that the TTF
+     * is left unchanged. This keeps the correction confined to the band where the
+     * factors stay comfortably away from their zeros.
+     */
+    static void deconvolveChain(double[] mtf, double[] frequency, double pixelWidthMm, double dxMm) {
+        double maxGain = 1.0;
+        try { maxGain = Double.parseDouble(System.getProperty("ttf.deconvMaxGain", "1.3")); }
+        catch (NumberFormatException ignore) { maxGain = 1.3; }
+        double fMax;
+        try { fMax = Double.parseDouble(System.getProperty("ttf.deconvFmaxLpMm",
+                Double.toString(1.0 / (2.0 * pixelWidthMm)))); }
+        catch (NumberFormatException ignore) { fMax = 1.0 / (2.0 * pixelWidthMm); }
+
+        for (int k = 0; k < mtf.length; k++) {
+            double f = frequency[k];
+            if (f <= 0.0 || f > fMax) continue;
+
+            double hDiff = sincNorm(f * dxMm);                 // (A)
+            double hLanc = lanczosTransfer(f * pixelWidthMm);  // (B), nu in cycles/pixel
+            double h = hDiff * hLanc;
+            if (!(h > 0.0)) continue;
+
+            double gain = 1.0 / h;
+            if (gain > maxGain) gain = maxGain;                // clamp noise amplification
+            mtf[k] *= gain;
+        }
+    }
+
+    /** Normalized sinc: sin(pi x)/(pi x), with sinc(0)=1. */
+    private static double sincNorm(double x) {
+        if (x == 0.0) return 1.0;
+        double px = Math.PI * x;
+        return Math.sin(px) / px;
+    }
+
+    /**
+     * Continuous Fourier transform of the Lanczos-3 interpolation kernel,
+     * evaluated at nu cycles/pixel and normalized so H(0)=1. The kernel is even
+     * and real, so the transform is real; evaluated by midpoint quadrature over
+     * the finite support |t|<a. Cheap and allocation-free.
+     */
+    private static double lanczosTransfer(double nu) {
+        final int a = 3;
+        final int N = 2000;
+        double step = (2.0 * a) / N;
+        double acc = 0.0, dc = 0.0;
+        for (int i = 0; i < N; i++) {
+            double t = -a + (i + 0.5) * step;
+            double w = lanczos(t, a);
+            dc += w;
+            acc += w * Math.cos(2.0 * Math.PI * nu * t);
+        }
+        if (dc == 0.0) return 1.0;
+        return acc / dc;
     }
 
     // --- Windowing strategy selection (opt-in; default preserves legacy behavior) ---
