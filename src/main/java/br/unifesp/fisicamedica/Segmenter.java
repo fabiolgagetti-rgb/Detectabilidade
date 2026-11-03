@@ -412,8 +412,9 @@ public class Segmenter {
         List<Double> edgeContrasts = new ArrayList<>();
 
         for (PartialAreaEdgeDetector.EdgePixel ep : paeResult.edges) {
-             double valI0 = cal.getCValue(ep.i0);
-             double valI1 = cal.getCValue(ep.i1);
+             double[] flat = contrastAwayFromEdge(origIp, ep.x + rx, ep.y + ry, ep.nx, ep.ny, ep.i0, ep.i1);
+             double valI0 = cal.getCValue(flat[0]);
+             double valI1 = cal.getCValue(flat[1]);
              double c = Math.abs(valI1 - valI0);
              edgeContrasts.add(c);
         }
@@ -436,8 +437,9 @@ public class Segmenter {
              double[] sumI1InBin = new double[numBins];
 
              for (PartialAreaEdgeDetector.EdgePixel ep : paeResult.edges) {
-                 double valI0 = cal.getCValue(ep.i0);
-                 double valI1 = cal.getCValue(ep.i1);
+                 double[] flat = contrastAwayFromEdge(origIp, ep.x + rx, ep.y + ry, ep.nx, ep.ny, ep.i0, ep.i1);
+                 double valI0 = cal.getCValue(flat[0]);
+                 double valI1 = cal.getCValue(flat[1]);
                  double c = Math.abs(valI1 - valI0);
 
                  int bin = (int) ((c - minC) / binSize);
@@ -508,6 +510,51 @@ public class Segmenter {
             processedMask.setColor(255);
             processedMask.fill(finalRoi);
         }
+    }
+
+    /**
+     * Overshoot-robust edge contrast for a single sub-pixel edge pixel.
+     *
+     * The PAE detector's ep.i0/ep.i1 are taken from the smoothed intensities
+     * INSIDE the detector window (+/-4 px around the edge). For edge-enhancing
+     * reconstruction kernels (Lung, Bone, Edge, ...) that window straddles the
+     * overshoot/undershoot ringing, so i1-i0 overestimates the true step height
+     * (e.g. ~122 HU measured vs a 100 HU step on Lung). That inflated value then
+     * fails to match the ESF endpoint contrast (measured in the flat regions),
+     * so every ESF profile is rejected and the TTF cannot be computed at low noise.
+     *
+     * This samples the image a standoff distance beyond the ringing, on both
+     * sides of the edge along its normal, averaging a few samples for stability.
+     * Falls back to the PAE i0/i1 if sampling leaves the image.
+     *
+     * @param ipRaw  raw image to sample (same coordinate frame as x,y)
+     * @param x,y    edge position (image coordinates)
+     * @param nx,ny  unit edge normal
+     * @return {valLow, valHigh} as RAW intensities (not yet calibrated)
+     */
+    private static double[] contrastAwayFromEdge(ImageProcessor ipRaw, double x, double y,
+                                                 double nx, double ny,
+                                                 double fallbackLow, double fallbackHigh) {
+        // Standoff past the overshoot lobes; averaged over a short run to reduce noise.
+        final double standoff = 5.0;   // px; beyond the typical ringing extent
+        final int    nAvg     = 3;     // samples averaged per side
+        final double sampleStep = 1.0; // px between averaged samples
+
+        double sumA = 0, sumB = 0;
+        int cntA = 0, cntB = 0;
+        int w = ipRaw.getWidth(), h = ipRaw.getHeight();
+        for (int s = 0; s < nAvg; s++) {
+            double d = standoff + s * sampleStep;
+            double ax = x + nx * d, ay = y + ny * d;   // one side (outer/inner)
+            double bx = x - nx * d, by = y - ny * d;   // the other side
+            if (ax >= 0 && ay >= 0 && ax < w && ay < h) { sumA += ipRaw.getInterpolatedValue(ax, ay); cntA++; }
+            if (bx >= 0 && by >= 0 && bx < w && by < h) { sumB += ipRaw.getInterpolatedValue(bx, by); cntB++; }
+        }
+        if (cntA == 0 || cntB == 0) {
+            return new double[]{ Math.min(fallbackLow, fallbackHigh), Math.max(fallbackLow, fallbackHigh) };
+        }
+        double va = sumA / cntA, vb = sumB / cntB;
+        return new double[]{ Math.min(va, vb), Math.max(va, vb) };
     }
 
     private static double getCircularity(FloatPolygon fp) {

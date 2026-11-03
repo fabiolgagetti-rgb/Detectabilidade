@@ -76,7 +76,68 @@ public class TtfCalc {
 
             double[] lsf = derivate(avgEsf);
             double[] mtf = calculateTtf(lsf, 2 * fftPoints);
-            
+
+            // ----------------------------------------------------------------
+            // TODO(Problem A): deconvolve the measurement-chain transfer
+            // functions out of `mtf` to remove the systematic low bias
+            // (~5% on edge-enhancing kernels, worst in the mid-band).
+            //
+            // WHY THIS IS MATHEMATICALLY JUSTIFIED
+            // ------------------------------------
+            // The measured TTF is the true system MTF multiplied by the
+            // transfer functions of the operators we apply when estimating it.
+            // Each operator below is linear and shift-invariant along the
+            // supersampled ESF axis, so in the Fourier domain they are exact
+            // multiplicative factors H_i(f). The pipeline computes
+            //
+            //     ESF --(1) Lanczos resample at step dx --(2) first difference
+            //         --(3) Tukey window--> LSF,   MTF = |FFT(LSF)| / FFT[0].
+            //
+            // By the convolution theorem the measured transform factorises as
+            //
+            //     MTF_meas(f) = MTF_true(f) * H_lanczos(f) * H_diff(f) * (window bias)
+            //
+            // where the first two factors are KNOWN in closed form:
+            //
+            //  (2) First difference lsf[i] = esf[i+1]-esf[i] is a convolution
+            //      with the kernel {+1,-1} at spacing dx. Its transfer function
+            //      is the forward-difference operator
+            //          D(f)       = (e^{+j2*pi*f*dx} - 1)/dx            (complex),
+            //          |D(f)|      = (2/dx) * |sin(pi*f*dx)|.
+            //      The IDEAL derivative we intend to approximate has transfer
+            //      |D_ideal(f)| = 2*pi*f. Hence the finite-difference imposes a
+            //      frequency-dependent gain
+            //          H_diff(f)  = |sin(pi*f*dx)| / (pi*f*dx)  = sinc(f*dx),
+            //      i.e. a sinc droop: ~1% at f=0.3 lp/mm, ~10% near Nyquist for
+            //      dx = 0.5*pixelWidth. (The linear-phase factor only recentres
+            //      the LSF and drops out of the magnitude |FFT|.)
+            //
+            //  (1) Lanczos-3 interpolation is convolution with the Lanczos
+            //      kernel L_a(t) = sinc(t)*sinc(t/a), a=3, sampled at the ESF
+            //      step. Its transfer function H_lanczos(f) is the (known)
+            //      Fourier transform of that kernel evaluated on [0, f_Nyquist];
+            //      it is ~1 at low f and rolls off toward Nyquist, accounting
+            //      for the high-frequency part of the observed droop.
+            //
+            // THE CORRECTION
+            // --------------
+            // Because the factors are multiplicative and non-zero over the band
+            // of interest (0 .. pixel Nyquist, well below the first sinc zero at
+            // f = 1/dx), the unbiased estimate is a straight division:
+            //
+            //     MTF_corrected(f) = MTF_meas(f) / (H_diff(f) * H_lanczos(f)).
+            //
+            // This is a deconvolution by pointwise division in the frequency
+            // domain. It is safe here (no noise amplification blow-up) because
+            // both factors stay comfortably above ~0.9 across the reported band
+            // and we never divide near a transfer-function zero. The window bias
+            // is handled separately by the side-lobe-aware window in derivate();
+            // only the two analytic, kernel-independent factors are divided out
+            // here. Implement as: build H_diff(f) and H_lanczos(f) on the same
+            // frequency grid as `frequency` below, then divide `mtf` by their
+            // product before storing it.
+            // ----------------------------------------------------------------
+
             double samplingStepPx = 0.5; 
             double dx_mm = samplingStepPx * cal.pixelWidth; 
             double fNyquist = 1.0 / (2.0 * dx_mm); 
@@ -109,7 +170,14 @@ public class TtfCalc {
 
         int half = profileLength / 2;
         double step = 0.5;
-        double toleranceHU = 15.0; 
+        // Contrast-matching tolerance. Kept as an ABSOLUTE HU floor (rejects profiles
+        // corrupted by internal structures, e.g. bone marrow inside a spine insert,
+        // which shift the endpoint contrast) PLUS a RELATIVE band that scales with the
+        // expected contrast. The relative term bridges the systematic gap between the
+        // segmenter's contrast estimate and the ESF endpoint contrast on edge-enhancing
+        // kernels, without widening the window for low-contrast structures.
+        double toleranceHU = Double.parseDouble(System.getProperty("ttf.tolHU", "15"));
+        double relTol      = Double.parseDouble(System.getProperty("ttf.relTol", "0.20"));
         
         List<List<double[]>> groupedProfiles = new ArrayList<>();
         boolean checkContrast = expectedContrasts != null && !expectedContrasts.isEmpty() && expectedContrasts.get(0) > 0;
@@ -216,8 +284,10 @@ public class TtfCalc {
                 double valBgd = 0;
                 double valObject = 0;
                 for(int p = 0; p < avgPts; p++) {
-                    valBgd += cal.getCValue(profile[p]);
-                    valObject += cal.getCValue(profile[profileLength - 1 - p]);
+                    // profile[] is already calibrated (cal.getCValue applied when sampled);
+                    // do NOT calibrate a second time.
+                    valBgd += profile[p];
+                    valObject += profile[profileLength - 1 - p];
                 }
                 valBgd /= avgPts;
                 valObject /= avgPts;
@@ -230,12 +300,13 @@ public class TtfCalc {
                 for (int c = 0; c < expectedContrasts.size(); c++) {
                     double expected = expectedContrasts.get(c);
                     double diff = Math.abs(edgeContrast - expected);
-                    if (diff <= toleranceHU && diff < minDiff) {
+                    double tol = Math.max(toleranceHU, relTol * Math.abs(expected));
+                    if (diff <= tol && diff < minDiff) {
                         minDiff = diff;
                         bestMatchIdx = c;
                     }
                 }
-                
+
                 if (bestMatchIdx != -1) {
                     groupedProfiles.get(bestMatchIdx).add(profile);
                 }
@@ -322,54 +393,141 @@ public class TtfCalc {
         return mtfSum;
     }
 
+    // --- Windowing strategy selection (opt-in; default preserves legacy behavior) ---
+    // Select with -Dttf.window=current|sidelobe . Tunables (sidelobe) via sysprops below.
+    private static String winStrategy() {
+        return System.getProperty("ttf.window", "current");
+    }
+    private static double prop(String key, double def) {
+        String v = System.getProperty(key);
+        if (v == null) return def;
+        try { return Double.parseDouble(v); } catch (NumberFormatException e) { return def; }
+    }
+
     public static double[] derivate(double[] esf) {
         int n = esf.length;
         double[] lsf = new double[n];
-        
-        for(int i = 0; i < n - 1; i++) {
+
+        for (int i = 0; i < n - 1; i++) {
             lsf[i] = esf[i + 1] - esf[i];
         }
         lsf[n - 1] = 0;
 
-        int sizeLsf = n;
-        double max = 0;
-        for(int k = 0; k < lsf.length; k++) {
-            if(Math.abs(lsf[k]) > max) {
-                max = Math.abs(lsf[k]);
-            }
+        if ("sidelobe".equalsIgnoreCase(winStrategy())) {
+            return windowSidelobe(lsf);
         }
-        
+        return windowCurrent(lsf);
+    }
+
+    /**
+     * Legacy window: Tukey whose flat-top is derived from the central-peak FWHM
+     * (alpha = 1 - 4*FWHM/N). Suppresses noise well but tapers the LSF side-lobes
+     * that carry edge-enhancement overshoot (e.g. Lung kernel).
+     */
+    private static double[] windowCurrent(double[] lsf) {
+        int sizeLsf = lsf.length;
+        double max = 0;
+        for (int k = 0; k < lsf.length; k++) {
+            if (Math.abs(lsf[k]) > max) max = Math.abs(lsf[k]);
+        }
+
         int left = 0, right = 0;
         boolean peak = false;
-        
-        for(int i = 0; i < sizeLsf; i++) {
-            if(Math.abs(lsf[i]) > max / 2 && !peak) {
-                left = i; peak = true;
-            }
-            if(Math.abs(lsf[i]) < max / 2 && peak) {
-                right = i; break;
-            }
+        for (int i = 0; i < sizeLsf; i++) {
+            if (Math.abs(lsf[i]) > max / 2 && !peak) { left = i; peak = true; }
+            if (Math.abs(lsf[i]) < max / 2 && peak)  { right = i; break; }
         }
-        
+
         double FWHM = right - left;
         double alpha = 1 - (FWHM * 4 / sizeLsf);
         double steepness = 5;
+        return applyTukey(lsf, alpha, steepness);
+    }
 
+    /**
+     * Side-lobe-aware, noise-adaptive Tukey window.
+     *
+     * Rationale: an edge-enhancing kernel produces an LSF with significant
+     * negative side-lobes whose radius is governed by the kernel (not by the
+     * central-peak FWHM). The legacy FWHM-based taper clips those lobes and
+     * suppresses the low/mid-frequency MTF overshoot. This strategy instead:
+     *   1. Estimates the tail noise sigma from the flat outer region of the LSF.
+     *   2. Scans outward from the LSF peak and finds the farthest sample whose
+     *      magnitude exceeds k*sigma -> the signal radius R (keeps side-lobes
+     *      when they rise above noise; clamps tight on SOFT / high noise).
+     *   3. Builds a flat top of half-width R+guard and tapers only beyond it,
+     *      with taper steepness scaled by the estimated noise.
+     *
+     * Tunables (sysprops): ttf.k, ttf.guard, ttf.minAlpha, ttf.steepMin, ttf.steepMax.
+     */
+    private static double[] windowSidelobe(double[] lsf) {
+        int size = lsf.length;
+        double k        = prop("ttf.k", 3.0);
+        int guard       = (int) prop("ttf.guard", 3);
+        double minAlpha = prop("ttf.minAlpha", 0.10);
+        double steepMin = prop("ttf.steepMin", 2.0);
+        double steepMax = prop("ttf.steepMax", 6.0);
+
+        // 1) peak index and peak magnitude
+        int peakIdx = 0;
+        double peakMag = 0;
+        for (int i = 0; i < size; i++) {
+            if (Math.abs(lsf[i]) > peakMag) { peakMag = Math.abs(lsf[i]); peakIdx = i; }
+        }
+
+        // 2) tail noise sigma from outer 20% (both ends), far from the edge structure
+        int tail = Math.max(3, size / 5);
+        double mean = 0; int cnt = 0;
+        for (int i = 0; i < tail; i++)            { mean += lsf[i]; cnt++; }
+        for (int i = size - tail; i < size; i++)  { mean += lsf[i]; cnt++; }
+        mean /= cnt;
+        double var = 0;
+        for (int i = 0; i < tail; i++)            { double d = lsf[i] - mean; var += d * d; }
+        for (int i = size - tail; i < size; i++)  { double d = lsf[i] - mean; var += d * d; }
+        double sigma = Math.sqrt(var / cnt);
+
+        // 3) signal radius: farthest sample from the peak above k*sigma
+        double thresh = Math.max(k * sigma, peakMag * 1e-6);
+        int radius = 0;
+        for (int r = 1; r < size; r++) {
+            int li = peakIdx - r, ri = peakIdx + r;
+            boolean sig = false;
+            if (li >= 0   && Math.abs(lsf[li]) > thresh) sig = true;
+            if (ri < size && Math.abs(lsf[ri]) > thresh) sig = true;
+            if (sig) radius = r;
+        }
+
+        // 4) flat-top half-width -> alpha
+        int flatHalf = Math.min(radius + guard, size / 2);
+        double flatWidth = 2.0 * flatHalf;
+        double alpha = 1.0 - flatWidth / size;
+        if (alpha < minAlpha) alpha = minAlpha;
+        if (alpha > 1.0) alpha = 1.0;
+
+        // 5) steepness scales with relative noise (more noise -> steeper roll-off)
+        double snr = peakMag > 0 ? sigma / peakMag : 0.0;          // ~0 low noise .. larger high noise
+        double steepness = steepMin + (steepMax - steepMin) * Math.min(1.0, snr / 0.1);
+
+        return applyTukey(lsf, alpha, steepness);
+    }
+
+    /** Asymmetric-power Tukey window applied symmetrically over the LSF support. */
+    private static double[] applyTukey(double[] lsf, double alpha, double steepness) {
+        int sizeLsf = lsf.length;
         double[] windowedLsf = new double[sizeLsf];
         if (alpha <= 0) {
-            for (int i = 0; i < sizeLsf; i++) windowedLsf[i] = lsf[i];
+            System.arraycopy(lsf, 0, windowedLsf, 0, sizeLsf);
         } else if (alpha >= 1.0) {
             for (int i = 0; i < sizeLsf; i++) {
-                double x = (double)i / (sizeLsf - 1);
+                double x = (double) i / (sizeLsf - 1);
                 double w = 0.5 * (1 - Math.cos(2 * Math.PI * x));
                 windowedLsf[i] = lsf[i] * w;
             }
         } else {
+            double halfAlpha = alpha / 2.0;
             for (int i = 0; i < sizeLsf; i++) {
                 double x = (double) i / (sizeLsf - 1);
                 double w;
-                double halfAlpha = alpha / 2.0;
-
                 if (x < halfAlpha) {
                     double t = Math.pow(x / halfAlpha, steepness);
                     w = 0.5 * (1 + Math.cos(Math.PI * (t - 1)));
