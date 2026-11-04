@@ -187,7 +187,10 @@ public class TtfCalc {
      */
     public static List<List<double[]>> calculateESF(Calibration cal, ImageProcessor ip, FloatPolygon boundary, int profileLength, boolean invert, List<Double> expectedContrasts, double[][] pointNormals) {
         if (boundary == null) throw new IllegalArgumentException("null ROI");
-        boolean usePaeNormals = Boolean.getBoolean("ttf.paeNormals")
+        // Option C (ttf.paePrimary) builds the polygon from PAE points and implies
+        // using their analytic per-point normals; Option A (ttf.paeNormals) enables
+        // the same normal use on the legacy wand-anchored polygon.
+        boolean usePaeNormals = (Boolean.getBoolean("ttf.paeNormals") || Boolean.getBoolean("ttf.paePrimary"))
                 && pointNormals != null && pointNormals.length == boundary.npoints;
 
         // Optional smoothing of the PAE normals along the edge ordering. PAE normals

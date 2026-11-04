@@ -383,7 +383,19 @@ public class Segmenter {
         cleanWand.autoOutline((int)(centerX - rx), (int)(centerY - ry), minHU, maxHU, 8 | 256);
         // PAE normals collected in lockstep with finalSubpixelPolygon points (Option A).
         List<double[]> finalNormals = new ArrayList<>();
-        if (cleanWand.npoints > 0) {
+
+        if (Boolean.getBoolean("ttf.paePrimary")) {
+            // ---- Option C: build the polygon from the PAE edge points directly ----
+            // The PAE edge list IS the sub-pixel edge; it is gap-free wherever a true
+            // edge exists. Rather than walk the wand and snap-or-drop (which creates
+            // holes), we keep every PAE point that belongs to this insert's edge,
+            // order them around the contour, and carry each point's analytic normal.
+            // The wand is used only to (a) establish the interior reference (centroid)
+            // for ordering and (b) reject stray edges far from the detected outline.
+            // centroid in CROP coordinates (PAE edges and wand are crop-relative)
+            buildPolygonFromPae(paeResult, cleanWand, centerX - rx, centerY - ry, rx, ry,
+                    finalSubpixelPolygon, finalNormals);
+        } else if (cleanWand.npoints > 0) {
             List<Point> denseWand = new ArrayList<>();
             for (int i = 0; i < cleanWand.npoints; i++) {
                 int x1 = cleanWand.xpoints[i];
@@ -534,6 +546,81 @@ public class Segmenter {
             processedMask.setColor(255);
             processedMask.fill(finalRoi);
         }
+    }
+
+    /**
+     * Option C: build the edge polygon directly from the PAE edge points.
+     *
+     * The PAE edge list is the sub-pixel edge and is gap-free wherever a true
+     * edge exists, so using it directly avoids the "holes" the wand snap-or-drop
+     * anchoring produces. We:
+     *   1. keep PAE points near the wand outline (reject strays far from it),
+     *   2. order them around the contour by polar angle about the wand centroid
+     *      (the inserts are star-shaped about their centre; the circularity gate
+     *      downstream already assumes near-circular edges),
+     *   3. emit polygon points + each point's own analytic PAE normal.
+     *
+     * Because each point carries its own normal, ordering only affects polygon
+     * topology (used by the circularity gate), never the ESF normals, so a mild
+     * mis-order cannot corrupt the ESF.
+     *
+     * @param paeResult detector output (edge pixels in crop coordinates)
+     * @param wand      the clean wand outline (crop coords) -> centroid + gating
+     * @param centerX,centerY wand-polygon centroid in CROP coordinates
+     * @param rx,ry     crop origin offset to map back to image coordinates
+     * @param outPoly   receives the ordered sub-pixel polygon (image coords)
+     * @param outNormals receives the per-point unit normals, aligned 1:1 with outPoly
+     */
+    private static void buildPolygonFromPae(PartialAreaEdgeDetector.Result paeResult, Wand wand,
+            double centerX, double centerY, int rx, int ry,
+            FloatPolygon outPoly, List<double[]> outNormals) {
+        if (paeResult == null || paeResult.edges == null || paeResult.edges.isEmpty()) return;
+
+        // Interior reference: centroid of the wand outline (crop coords). centerX/Y
+        // are already that centroid mapped from the wand polygon; use directly.
+        double cx = centerX, cy = centerY;
+
+        // Gating radius: median wand radius +/- a tolerance, to drop stray PAE edges
+        // (e.g. internal-structure edges) that are not on this insert's boundary.
+        double meanR = 0; int wn = Math.max(1, wand.npoints);
+        for (int i = 0; i < wand.npoints; i++) {
+            meanR += Math.hypot(wand.xpoints[i] - cx, wand.ypoints[i] - cy);
+        }
+        meanR /= wn;
+        double rTol = Math.max(5.0, 0.5 * meanR);   // generous band around the wand radius
+
+        // Collect in-band PAE points. The PAE edge is ~1-2 px thick and the detector
+        // may emit several points at nearly the same polar angle (inner/outer side,
+        // restoration duplicates). A raw polar-angle sort of those zig-zags radially
+        // and inflates the perimeter (crashing the circularity gate). So bin by angle
+        // and keep ONE representative per bin: the point whose radius is closest to the
+        // local contour radius, giving a clean single-valued, ordered contour.
+        int nBins = Math.max(180, (int) (2 * Math.PI * meanR));   // ~<=1 point/px of arc
+        PartialAreaEdgeDetector.EdgePixel[] best = new PartialAreaEdgeDetector.EdgePixel[nBins];
+        double[] bestErr = new double[nBins];
+        java.util.Arrays.fill(bestErr, Double.MAX_VALUE);
+
+        for (PartialAreaEdgeDetector.EdgePixel ep : paeResult.edges) {
+            double r = Math.hypot(ep.x - cx, ep.y - cy);
+            if (Math.abs(r - meanR) > rTol) continue;             // reject strays
+            double ang = Math.atan2(ep.y - cy, ep.x - cx);        // [-pi, pi)
+            int bin = (int) ((ang + Math.PI) / (2 * Math.PI) * nBins);
+            if (bin < 0) bin = 0; else if (bin >= nBins) bin = nBins - 1;
+            double err = Math.abs(r - meanR);                     // closeness to contour radius
+            if (err < bestErr[bin]) { bestErr[bin] = err; best[bin] = ep; }
+        }
+
+        int used = 0;
+        for (int b = 0; b < nBins; b++) {                         // already in angular order
+            PartialAreaEdgeDetector.EdgePixel ep = best[b];
+            if (ep == null) continue;                             // empty bin: no PAE edge there
+            outPoly.addPoint((float) (ep.x + rx), (float) (ep.y + ry));
+            outNormals.add(new double[]{ ep.nx, ep.ny });
+            used++;
+        }
+        // Every emitted point is a real PAE edge point (no snap-or-drop holes). Empty
+        // angular bins are genuine edge absences, not anchoring holes; record no holes.
+        for (int i = 0; i < used; i++) EdgeDiagnostics.recordAnchor(false);
     }
 
     /**
