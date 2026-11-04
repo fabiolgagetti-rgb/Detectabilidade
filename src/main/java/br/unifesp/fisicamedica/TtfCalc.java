@@ -62,7 +62,13 @@ public class TtfCalc {
                 Roi roi = dR.rois.get(i).get(j - 1);
                 FloatPolygon boundary = roi.getFloatPolygon();
 
-                List<List<double[]>> groupedEsfs = calculateESF(cal, ip, boundary, (int) (10 / cal.pixelWidth), invert, singleExpectedContrastList);
+                double[][] pointNormals = null;
+                if (dR.edgeNormals != null && i < dR.edgeNormals.size()
+                        && dR.edgeNormals.get(i) != null && (j - 1) < dR.edgeNormals.get(i).size()) {
+                    pointNormals = dR.edgeNormals.get(i).get(j - 1);
+                }
+
+                List<List<double[]>> groupedEsfs = calculateESF(cal, ip, boundary, (int) (10 / cal.pixelWidth), invert, singleExpectedContrastList, pointNormals);
                 
                 if (groupedEsfs != null && !groupedEsfs.isEmpty() && groupedEsfs.get(0) != null) {
                     esfProfilesAccumulated.addAll(groupedEsfs.get(0));
@@ -164,7 +170,51 @@ public class TtfCalc {
     }
 
     public static List<List<double[]>> calculateESF(Calibration cal, ImageProcessor ip, FloatPolygon boundary, int profileLength, boolean invert, List<Double> expectedContrasts) {
+        return calculateESF(cal, ip, boundary, profileLength, invert, expectedContrasts, null);
+    }
+
+    /**
+     * ESF sampling with an optional per-point normal array (Option A).
+     *
+     * When pointNormals is non-null, aligned 1:1 with the boundary polygon, and
+     * -Dttf.paeNormals=true, the profile at each boundary point is sampled along
+     * that point's own analytic (PAE) normal instead of a least-squares fit over
+     * neighbouring polygon points. The neighbour-fit is sensitive to gaps in the
+     * polygon ("holes" left when a wand point has no nearby PAE edge): a hole makes
+     * distant vertices adjacent and skews the fitted tangent/normal. A per-point
+     * analytic normal is independent of polygon topology and so is immune to holes.
+     * Falls back to the neighbour-fit when normals are unavailable for a point.
+     */
+    public static List<List<double[]>> calculateESF(Calibration cal, ImageProcessor ip, FloatPolygon boundary, int profileLength, boolean invert, List<Double> expectedContrasts, double[][] pointNormals) {
         if (boundary == null) throw new IllegalArgumentException("null ROI");
+        boolean usePaeNormals = Boolean.getBoolean("ttf.paeNormals")
+                && pointNormals != null && pointNormals.length == boundary.npoints;
+
+        // Optional smoothing of the PAE normals along the edge ordering. PAE normals
+        // are local and hole-immune but per-point noisy; averaging each with its
+        // neighbours (a +/- window, in polygon index order) recovers the noise
+        // reduction the neighbour-fit provided, WITHOUT reintroducing hole
+        // sensitivity (a dropped point just means one fewer term in the average).
+        // -Dttf.paeNormalSmooth = half-window in points (0 = raw PAE normals).
+        double[][] normals = pointNormals;
+        if (usePaeNormals) {
+            int halfWin = Integer.getInteger("ttf.paeNormalSmooth", 3);
+            if (halfWin > 0) {
+                int n = pointNormals.length;
+                normals = new double[n][2];
+                for (int p = 0; p < n; p++) {
+                    double sx = 0, sy = 0;
+                    for (int w = -halfWin; w <= halfWin; w++) {
+                        int q = ((p + w) % n + n) % n;      // wrap around closed contour
+                        sx += pointNormals[q][0];
+                        sy += pointNormals[q][1];
+                    }
+                    double len = Math.hypot(sx, sy);
+                    if (len == 0) { normals[p][0] = pointNormals[p][0]; normals[p][1] = pointNormals[p][1]; }
+                    else { normals[p][0] = sx / len; normals[p][1] = sy / len; }
+                }
+            }
+        }
         profileLength *= 2;
         if (profileLength % 2 == 0) profileLength++;
 
@@ -193,6 +243,30 @@ public class TtfCalc {
         for (int i = 0; i < boundary.npoints - 1; i++) {
             float x0 = boundary.xpoints[i];
             float y0 = boundary.ypoints[i];
+
+            double nx, ny;
+
+            if (usePaeNormals) {
+                // Option A: use this point's own analytic PAE normal; independent of
+                // polygon neighbours, so holes in the polygon cannot skew it.
+                double pnx = normals[i][0];
+                double pny = normals[i][1];
+                double plen = Math.hypot(pnx, pny);
+                if (plen == 0) continue;   // degenerate normal; skip (one fewer profile)
+                nx = pnx / plen;
+                ny = pny / plen;
+                if (invert) { nx = -nx; ny = -ny; }
+                double[] profile = new double[profileLength];
+                for (int j = -half; j <= half; j++) {
+                    double x = x0 + j * step * nx;
+                    double y = y0 + j * step * ny;
+                    double val = getLanczosInterpolatedPixel(ip, x, y);
+                    profile[j + half] = cal.getCValue(val);
+                }
+                addProfileWithContrastCheck(profile, profileLength, checkContrast,
+                        expectedContrasts, toleranceHU, relTol, groupedProfiles);
+                continue;
+            }
 
             double searchRadiusMM = 5.0;
             double searchRadiusPx = searchRadiusMM / cal.pixelWidth;
@@ -265,8 +339,8 @@ public class TtfCalc {
             dx /= length;
             dy /= length;
             
-            double nx = -dy;
-            double ny = dx;
+            nx = -dy;
+            ny = dx;
 
             if (invert) { nx = -nx; ny = -ny; }
 
@@ -317,7 +391,43 @@ public class TtfCalc {
         
         return groupedProfiles;
     }
-    
+
+    /**
+     * Applies the contrast-match gate and files a profile into the right group.
+     * Shared by the neighbour-fit and PAE-normal paths so both enforce the same
+     * internal-structure rejection (absolute HU floor + relative band).
+     */
+    private static void addProfileWithContrastCheck(double[] profile, int profileLength,
+            boolean checkContrast, List<Double> expectedContrasts,
+            double toleranceHU, double relTol, List<List<double[]>> groupedProfiles) {
+        if (checkContrast) {
+            int avgPts = 3;
+            double valBgd = 0, valObject = 0;
+            for (int p = 0; p < avgPts; p++) {
+                valBgd += profile[p];
+                valObject += profile[profileLength - 1 - p];
+            }
+            valBgd /= avgPts;
+            valObject /= avgPts;
+            double edgeContrast = Math.abs(valObject - valBgd);
+
+            int bestMatchIdx = -1;
+            double minDiff = Double.MAX_VALUE;
+            for (int c = 0; c < expectedContrasts.size(); c++) {
+                double expected = expectedContrasts.get(c);
+                double diff = Math.abs(edgeContrast - expected);
+                double tol = Math.max(toleranceHU, relTol * Math.abs(expected));
+                if (diff <= tol && diff < minDiff) {
+                    minDiff = diff;
+                    bestMatchIdx = c;
+                }
+            }
+            if (bestMatchIdx != -1) groupedProfiles.get(bestMatchIdx).add(profile);
+        } else {
+            groupedProfiles.get(0).add(profile);
+        }
+    }
+
     public static double getLanczosInterpolatedPixel(ImageProcessor ip, double x, double y) {
         int a = 3; 
         

@@ -35,6 +35,16 @@ public class Segmenter {
 	    List<List<Double>> modeContrast = new ArrayList<>();
 	    List<List<Double>> meanI0 = new ArrayList<>();
 	    List<List<Double>> meanI1 = new ArrayList<>();
+
+	    // Option A (PAE edge normals), unit normals [nPoints][2] aligned 1:1 with the
+	    // final ROI polygon points, taken directly from the partial-area detector.
+	    // Lets the ESF step use each point's own analytic normal instead of a
+	    // neighbour-fit, so dropped points ("holes") no longer corrupt neighbouring
+	    // normals. May be null/empty when unavailable.
+	    //   edgeNormalsPerRoi : per-insert   (aligned with 'roi'),  set in processRecord
+	    //   edgeNormals       : per-insert, per-slice (aligned with 'rois'), set in edgeFinder
+	    List<double[][]> edgeNormalsPerRoi = new ArrayList<>();
+	    List<List<double[][]>> edgeNormals = new ArrayList<>();
 	}
 
     private static class OtsuResult {
@@ -88,14 +98,19 @@ public class Segmenter {
         int nSlices = stack.size();
         dR.rois = new ArrayList<>();
 
+        dR.edgeNormals = new ArrayList<>();
+
         for (int i = 0; i < dR.roi.size(); i++) {
             List<Roi> sliceRois = new ArrayList<>();
+            List<double[][]> sliceNormals = new ArrayList<>();
             Roi avgRoi = dR.roi.get(i);
+            double[][] avgNormals = (i < dR.edgeNormalsPerRoi.size()) ? dR.edgeNormalsPerRoi.get(i) : null;
             Rectangle bounds = dR.roi.get(i).getBounds();
 
             for (int z = 1; z <= nSlices; z++) {
                 if (avgSlices) {
                     sliceRois.add(avgRoi);
+                    sliceNormals.add(avgNormals);
                 } else {
                     ImageProcessor sliceIp = stack.getProcessor(z);
                     ImageProcessor blurredSlice = sliceIp.duplicate();
@@ -118,10 +133,13 @@ public class Segmenter {
 
                     if (!tempResult.roi.isEmpty()) {
                         sliceRois.add(tempResult.roi.get(0));
+                        sliceNormals.add(tempResult.edgeNormalsPerRoi.isEmpty()
+                                ? null : tempResult.edgeNormalsPerRoi.get(0));
                     }
                 }
             }
             dR.rois.add(sliceRois);
+            dR.edgeNormals.add(sliceNormals);
         }
         return dR;
     }
@@ -363,6 +381,8 @@ public class Segmenter {
         else { minHU = -Double.MAX_VALUE; maxHU = thresholdForEdge; }
 
         cleanWand.autoOutline((int)(centerX - rx), (int)(centerY - ry), minHU, maxHU, 8 | 256);
+        // PAE normals collected in lockstep with finalSubpixelPolygon points (Option A).
+        List<double[]> finalNormals = new ArrayList<>();
         if (cleanWand.npoints > 0) {
             List<Point> denseWand = new ArrayList<>();
             for (int i = 0; i < cleanWand.npoints; i++) {
@@ -396,8 +416,11 @@ public class Segmenter {
                         bestEdge = ep;
                     }
                 }
+                EdgeDiagnostics.recordAnchor(bestEdge == null);
                 if (bestEdge != null) {
                     finalSubpixelPolygon.addPoint((float)(bestEdge.x + rx), (float)(bestEdge.y + ry));
+                    // store this point's analytic PAE normal (unit vector)
+                    finalNormals.add(new double[]{ bestEdge.nx, bestEdge.ny });
                 }
             }
         }
@@ -503,6 +526,7 @@ public class Segmenter {
         dR.Threshold.add(cal.getCValue(thresholdForEdge));
 
         dR.roi.add(finalRoi);
+        dR.edgeNormalsPerRoi.add(finalNormals.toArray(new double[0][]));
 
         dR.Pos.add(new Point((int)Math.round(centerX), (int)Math.round(centerY)));
 
