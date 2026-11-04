@@ -41,7 +41,6 @@ public class DetectabilityIndexPanel {
     private static JTextField AucResultField;
     
     private static JButton btnShowImages;
-    private static JButton btnGeneratePhantom;
     
     private static double[][] lastNps2D = null;
     private static double[] lastNpsFreq = null;
@@ -198,7 +197,6 @@ public class DetectabilityIndexPanel {
     
     private static void calculate(JPanel parent) {
         btnShowImages.setEnabled(false);
-        btnGeneratePhantom.setEnabled(false);
         
         try {
             double[] npsFreq = NPSpanel.getLastRadialFreq();
@@ -264,7 +262,6 @@ public class DetectabilityIndexPanel {
             lastTaskRadius = taskRadius;
             
             btnShowImages.setEnabled(true);
-            btnGeneratePhantom.setEnabled(true);
 
         } catch (NumberFormatException ex) {
             JOptionPane.showMessageDialog(parent, "Error in numerical input", "Error", JOptionPane.ERROR_MESSAGE);

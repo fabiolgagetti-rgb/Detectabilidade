@@ -350,10 +350,10 @@ public class Segmenter {
         // blurred/soft-kernel edges). The 30x threshold-lowering loop is replaced by
         // a single, bounded fallback now that the threshold is measured rather than guessed.
         PartialAreaEdgeDetector.Result paeResult =
-                PartialAreaEdgeDetector.detectAndRestoreIterative(cropDetector, gradThreshold, 2, 3);
+                PartialAreaEdgeDetector.detectAndRestoreIterative(cropDetector, gradThreshold, 2, 1);
         if (paeResult.edges.size() < ptCount) {
             paeResult = PartialAreaEdgeDetector.detectAndRestoreIterative(
-                    cropDetector, gradThreshold * 0.6, 2, 3);
+                    cropDetector, gradThreshold * 0.6, 2, 1);
         }
 
         FloatProcessor restoredCrop = paeResult.restoredImage;
