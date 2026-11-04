@@ -190,7 +190,8 @@ public class TtfCalc {
         // Option C (ttf.paePrimary) builds the polygon from PAE points and implies
         // using their analytic per-point normals; Option A (ttf.paeNormals) enables
         // the same normal use on the legacy wand-anchored polygon.
-        boolean usePaeNormals = (Boolean.getBoolean("ttf.paeNormals") || Boolean.getBoolean("ttf.paePrimary"))
+        boolean usePaeNormals = (Boolean.getBoolean("ttf.paeNormals") || Boolean.getBoolean("ttf.paePrimary")
+                || Boolean.getBoolean("ttf.paeFill"))
                 && pointNormals != null && pointNormals.length == boundary.npoints;
 
         // Optional smoothing of the PAE normals along the edge ordering. PAE normals
