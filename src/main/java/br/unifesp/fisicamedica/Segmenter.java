@@ -395,6 +395,13 @@ public class Segmenter {
             // centroid in CROP coordinates (PAE edges and wand are crop-relative)
             buildPolygonFromPae(paeResult, cleanWand, centerX - rx, centerY - ry, rx, ry,
                     finalSubpixelPolygon, finalNormals);
+        } else if (Boolean.getBoolean("ttf.paeFill") && cleanWand.npoints > 0) {
+            // ---- Option B: hole-FREE wand anchoring with spike guard + smoothing ----
+            // Keeps the wand-anchored geometry but eliminates holes at the source:
+            // a wider match tolerance fills most gaps, a shape/deviation test rejects
+            // spurious "spike" matches, genuine gaps are bridged by interpolation
+            // (never by a bad snap), and the contour is lightly smoothed at the end.
+            buildPolygonFilled(paeResult, cleanWand, rx, ry, finalSubpixelPolygon, finalNormals);
         } else if (cleanWand.npoints > 0) {
             List<Point> denseWand = new ArrayList<>();
             for (int i = 0; i < cleanWand.npoints; i++) {
@@ -621,6 +628,142 @@ public class Segmenter {
         // Every emitted point is a real PAE edge point (no snap-or-drop holes). Empty
         // angular bins are genuine edge absences, not anchoring holes; record no holes.
         for (int i = 0; i < used; i++) EdgeDiagnostics.recordAnchor(false);
+    }
+
+    /**
+     * Option B: hole-FREE wand anchoring with spike guard and smoothing.
+     *
+     * Keeps the wand-anchored contour (minimal change to the trusted geometry) but
+     * removes the "holes" the strict 3 px snap-or-drop leaves. Pipeline:
+     *
+     *   1. Densify the wand outline (as before) to get an ordered point sequence.
+     *   2. For each densified point, snap to the nearest PAE edge within a WIDER
+     *      tolerance (ttf.fillTolPx, default 6). This alone fills most gaps but can
+     *      introduce "spikes": a point near a PAE gap may grab a pixel from another
+     *      part of the contour, jutting off the smooth edge.
+     *   3. SPIKE GUARD: using the wand centroid as reference, reject any snapped
+     *      point whose radius deviates from the LOCAL median radius by more than
+     *      ttf.fillSpikePx (default 2.5). Rejected points become gaps (not spikes).
+     *   4. FILL gaps by linear interpolation of BOTH position and normal between the
+     *      nearest accepted points on each side (circular). A genuine gap is bridged
+     *      smoothly instead of forcing a bad snap -> no holes, no spikes.
+     *   5. SMOOTH: a light moving-average (ttf.fillSmooth half-window, default 1) on
+     *      the positions to remove residual jitter. Normals are re-derived from the
+     *      PAE matches (interpolated across fills) so they stay analytic where real.
+     *
+     * Emits points in image coordinates with aligned unit normals.
+     */
+    private static void buildPolygonFilled(PartialAreaEdgeDetector.Result paeResult, Wand wand,
+            int rx, int ry, FloatPolygon outPoly, List<double[]> outNormals) {
+        if (wand.npoints <= 0 || paeResult == null || paeResult.edges == null
+                || paeResult.edges.isEmpty()) return;
+
+        double fillTol   = getDoubleProp("ttf.fillTolPx", 6.0);
+        double spikeTol  = getDoubleProp("ttf.fillSpikePx", 2.5);
+        int smoothHalf   = (int) getDoubleProp("ttf.fillSmooth", 1);
+
+        // 1) densify wand outline (crop coords)
+        List<Point> dense = new ArrayList<>();
+        for (int i = 0; i < wand.npoints; i++) {
+            int x1 = wand.xpoints[i], y1 = wand.ypoints[i];
+            int ni = (i + 1) % wand.npoints;
+            int x2 = wand.xpoints[ni], y2 = wand.ypoints[ni];
+            dense.add(new Point(x1, y1));
+            int steps = Math.max(Math.abs(x2 - x1), Math.abs(y2 - y1));
+            for (int s = 1; s < steps; s++) {
+                dense.add(new Point(x1 + s * (x2 - x1) / steps, y1 + s * (y2 - y1) / steps));
+            }
+        }
+        int n = dense.size();
+        if (n < 3) return;
+
+        // centroid of the densified wand (interior reference for the spike guard)
+        double cx = 0, cy = 0;
+        for (Point p : dense) { cx += p.x; cy += p.y; }
+        cx /= n; cy /= n;
+
+        // 2) snap each densified point to nearest PAE edge within the wider tolerance
+        double[] px = new double[n], py = new double[n], pnx = new double[n], pny = new double[n];
+        boolean[] ok = new boolean[n];
+        double[] rad = new double[n];
+        for (int i = 0; i < n; i++) {
+            double qx = dense.get(i).x, qy = dense.get(i).y;
+            PartialAreaEdgeDetector.EdgePixel best = null;
+            double minDist = Double.MAX_VALUE;
+            for (PartialAreaEdgeDetector.EdgePixel ep : paeResult.edges) {
+                double d = Math.hypot(ep.x - qx, ep.y - qy);
+                if (d < minDist && d < fillTol) { minDist = d; best = ep; }
+            }
+            if (best != null) {
+                px[i] = best.x; py[i] = best.y; pnx[i] = best.nx; pny[i] = best.ny;
+                rad[i] = Math.hypot(best.x - cx, best.y - cy);
+                ok[i] = true;
+            }
+        }
+
+        // 3) spike guard: reject points whose radius deviates from the LOCAL median
+        //    (robust to the spike itself). Window is +/- a few points along the order.
+        boolean[] spike = new boolean[n];
+        int win = 4;
+        for (int i = 0; i < n; i++) {
+            if (!ok[i]) continue;
+            List<Double> local = new ArrayList<>();
+            for (int w = -win; w <= win; w++) {
+                int j = ((i + w) % n + n) % n;
+                if (ok[j]) local.add(rad[j]);
+            }
+            if (local.size() < 3) continue;
+            Collections.sort(local);
+            double med = local.get(local.size() / 2);
+            if (Math.abs(rad[i] - med) > spikeTol) spike[i] = true;
+        }
+        for (int i = 0; i < n; i++) if (spike[i]) ok[i] = false;   // demote spikes to gaps
+
+        long holes = 0;
+        for (int i = 0; i < n; i++) if (!ok[i]) holes++;
+        if (holes == n) return;   // nothing usable
+
+        // 4) fill gaps by circular linear interpolation of position AND normal
+        for (int i = 0; i < n; i++) {
+            if (ok[i]) continue;
+            int prev = i, fwd = i, backSteps = 0, fwdSteps = 0;
+            do { prev = (prev - 1 + n) % n; backSteps++; } while (!ok[prev] && backSteps < n);
+            do { fwd = (fwd + 1) % n; fwdSteps++; } while (!ok[fwd] && fwdSteps < n);
+            double t = (double) backSteps / (backSteps + fwdSteps);
+            px[i]  = (1 - t) * px[prev]  + t * px[fwd];
+            py[i]  = (1 - t) * py[prev]  + t * py[fwd];
+            double ix = (1 - t) * pnx[prev] + t * pnx[fwd];
+            double iy = (1 - t) * pny[prev] + t * pny[fwd];
+            double len = Math.hypot(ix, iy);
+            if (len == 0) { pnx[i] = pnx[prev]; pny[i] = pny[prev]; }
+            else { pnx[i] = ix / len; pny[i] = iy / len; }
+        }
+
+        // 5) light position smoothing (moving average) along the ordering
+        double[] sx = px, sy = py;
+        if (smoothHalf > 0) {
+            sx = new double[n]; sy = new double[n];
+            for (int i = 0; i < n; i++) {
+                double ax = 0, ay = 0; int c = 0;
+                for (int w = -smoothHalf; w <= smoothHalf; w++) {
+                    int j = ((i + w) % n + n) % n;
+                    ax += px[j]; ay += py[j]; c++;
+                }
+                sx[i] = ax / c; sy[i] = ay / c;
+            }
+        }
+
+        for (int i = 0; i < n; i++) {
+            outPoly.addPoint((float) (sx[i] + rx), (float) (sy[i] + ry));
+            outNormals.add(new double[]{ pnx[i], pny[i] });
+            EdgeDiagnostics.recordAnchor(false);   // hole-free by construction
+        }
+    }
+
+    private static double getDoubleProp(String key, double def) {
+        String v = System.getProperty(key);
+        if (v == null) return def;
+        try { return Double.parseDouble(v); } catch (NumberFormatException e) { return def; }
     }
 
     /**
