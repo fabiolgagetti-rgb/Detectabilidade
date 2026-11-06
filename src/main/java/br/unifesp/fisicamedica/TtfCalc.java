@@ -46,10 +46,24 @@ public class TtfCalc {
             double I1 = 0.0;
 
             if (!dR.modeContrast.isEmpty() && i < dR.modeContrast.size() && !dR.modeContrast.get(i).isEmpty()) {
-                targetContrast = dR.modeContrast.get(i).get(0);
-                I0 = dR.meanI0.get(i).get(0);
-                I1 = dR.meanI1.get(i).get(0);
-
+                // The segmenter may report more than one contrast population for a
+                // structure. For a thin high-contrast shell around a lower-contrast
+                // core (e.g. a vertebra ring around bone marrow), profiles that
+                // overshoot the thin shell read the core as the object side, creating
+                // a spurious LOWER-contrast population (background->marrow) alongside
+                // the true outer step (background->bone). The old code took get(0) =
+                // the most-populous bin, which under noise flips to the spurious core
+                // edge and corrupts the TTF. Select the LARGEST contrast instead: the
+                // true external step is always the biggest, so this robustly targets
+                // the outer silhouette and ignores thin-shell/core sub-edges.
+                List<Double> contrastsForInsert = dR.modeContrast.get(i);
+                int sel = 0;
+                for (int ci = 1; ci < contrastsForInsert.size(); ci++) {
+                    if (contrastsForInsert.get(ci) > contrastsForInsert.get(sel)) sel = ci;
+                }
+                targetContrast = contrastsForInsert.get(sel);
+                if (i < dR.meanI0.size() && sel < dR.meanI0.get(i).size()) I0 = dR.meanI0.get(i).get(sel);
+                if (i < dR.meanI1.size() && sel < dR.meanI1.get(i).size()) I1 = dR.meanI1.get(i).get(sel);
             }
             
             List<Double> singleExpectedContrastList = new ArrayList<>();
