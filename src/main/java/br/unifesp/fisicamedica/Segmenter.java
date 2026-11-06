@@ -744,7 +744,14 @@ public class Segmenter {
         int n = dense.size();
         if (n < 3) return;
 
-        // 2) snap each densified point to nearest PAE edge within the wider tolerance
+        // 2) snap each densified point to nearest PAE edge within the wider tolerance.
+        //    ok[i] = a PAE sub-pixel match was found. Points without a match keep the
+        //    WAND position as a provisional location (see step 4): the wand already
+        //    traces the true silhouette, so a wand point is a far better boundary
+        //    estimate than interpolating a chord across the gap. This matters on
+        //    long shallow segments (e.g. a vertebra wing underside) where the
+        //    densified wand line runs a few px off the discrete PAE edge pixels, so
+        //    interpolated points legitimately find no PAE match within tolerance.
         double[] px = new double[n], py = new double[n], pnx = new double[n], pny = new double[n];
         boolean[] ok = new boolean[n];
         for (int i = 0; i < n; i++) {
@@ -758,6 +765,8 @@ public class Segmenter {
             if (best != null) {
                 px[i] = best.x; py[i] = best.y; pnx[i] = best.nx; pny[i] = best.ny;
                 ok[i] = true;
+            } else {
+                px[i] = qx; py[i] = qy;        // provisional: the wand point itself
             }
         }
 
@@ -792,15 +801,25 @@ public class Segmenter {
         for (int i = 0; i < n; i++) if (!ok[i]) holes++;
         if (holes == n) return;   // nothing usable
 
-        // 4) fill gaps by circular linear interpolation of position AND normal
+        // 4) resolve non-PAE points. Two cases:
+        //    - spike-rejected: the PAE match was spurious, so DISCARD its position and
+        //      bridge by interpolation (position + normal) between trusted neighbours.
+        //    - no PAE match (not a spike): KEEP the wand position already stored in
+        //      px/py (the wand traces the true silhouette); only the NORMAL needs to
+        //      be borrowed from the nearest trusted neighbours. This stops long
+        //      shallow segments from being chorded across.
         for (int i = 0; i < n; i++) {
             if (ok[i]) continue;
             int prev = i, fwd = i, backSteps = 0, fwdSteps = 0;
             do { prev = (prev - 1 + n) % n; backSteps++; } while (!ok[prev] && backSteps < n);
             do { fwd = (fwd + 1) % n; fwdSteps++; } while (!ok[fwd] && fwdSteps < n);
             double t = (double) backSteps / (backSteps + fwdSteps);
-            px[i]  = (1 - t) * px[prev]  + t * px[fwd];
-            py[i]  = (1 - t) * py[prev]  + t * py[fwd];
+            if (!spike[i]) {
+                // keep the wand position (px/py already hold it); interpolate only the normal
+            } else {
+                px[i]  = (1 - t) * px[prev]  + t * px[fwd];
+                py[i]  = (1 - t) * py[prev]  + t * py[fwd];
+            }
             double ix = (1 - t) * pnx[prev] + t * pnx[fwd];
             double iy = (1 - t) * pny[prev] + t * pny[fwd];
             double len = Math.hypot(ix, iy);
