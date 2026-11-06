@@ -705,9 +705,12 @@ public class Segmenter {
      *      tolerance (ttf.fillTolPx, default 6). This alone fills most gaps but can
      *      introduce "spikes": a point near a PAE gap may grab a pixel from another
      *      part of the contour, jutting off the smooth edge.
-     *   3. SPIKE GUARD: using the wand centroid as reference, reject any snapped
-     *      point whose radius deviates from the LOCAL median radius by more than
-     *      ttf.fillSpikePx (default 2.5). Rejected points become gaps (not spikes).
+     *   3. SPIKE GUARD (trajectory-based, shape-agnostic): reject a snapped point
+     *      only if it lies more than ttf.fillSpikePx (default 2.5) from the straight
+     *      line through its nearest accepted neighbours on each side. This does NOT
+     *      assume a convex/star-shaped contour, so pointed features far from the
+     *      centre (e.g. vertebra wing tips) are kept while lone off-trajectory
+     *      matches are rejected. Rejected points become gaps (not spikes).
      *   4. FILL gaps by linear interpolation of BOTH position and normal between the
      *      nearest accepted points on each side (circular). A genuine gap is bridged
      *      smoothly instead of forcing a bad snap -> no holes, no spikes.
@@ -741,15 +744,9 @@ public class Segmenter {
         int n = dense.size();
         if (n < 3) return;
 
-        // centroid of the densified wand (interior reference for the spike guard)
-        double cx = 0, cy = 0;
-        for (Point p : dense) { cx += p.x; cy += p.y; }
-        cx /= n; cy /= n;
-
         // 2) snap each densified point to nearest PAE edge within the wider tolerance
         double[] px = new double[n], py = new double[n], pnx = new double[n], pny = new double[n];
         boolean[] ok = new boolean[n];
-        double[] rad = new double[n];
         for (int i = 0; i < n; i++) {
             double qx = dense.get(i).x, qy = dense.get(i).y;
             PartialAreaEdgeDetector.EdgePixel best = null;
@@ -760,26 +757,34 @@ public class Segmenter {
             }
             if (best != null) {
                 px[i] = best.x; py[i] = best.y; pnx[i] = best.nx; pny[i] = best.ny;
-                rad[i] = Math.hypot(best.x - cx, best.y - cy);
                 ok[i] = true;
             }
         }
 
-        // 3) spike guard: reject points whose radius deviates from the LOCAL median
-        //    (robust to the spike itself). Window is +/- a few points along the order.
+        // 3) spike guard (TRAJECTORY-based, shape-agnostic): a spurious match juts
+        //    off the local edge trajectory, i.e. it lies far from the straight line
+        //    through its nearest accepted neighbours ON EACH SIDE. This is measured
+        //    as the point's perpendicular distance to that chord. Unlike a
+        //    radius-from-centroid test, it does NOT assume a convex/star-shaped
+        //    contour, so legitimate far-from-centre features (e.g. the pointed wing
+        //    tips of a vertebra) are kept: there the neighbours continue along the
+        //    same direction, so the perpendicular deviation stays small. Only a lone
+        //    point stepping off an otherwise-smooth local run is rejected.
         boolean[] spike = new boolean[n];
-        int win = 4;
         for (int i = 0; i < n; i++) {
             if (!ok[i]) continue;
-            List<Double> local = new ArrayList<>();
-            for (int w = -win; w <= win; w++) {
-                int j = ((i + w) % n + n) % n;
-                if (ok[j]) local.add(rad[j]);
-            }
-            if (local.size() < 3) continue;
-            Collections.sort(local);
-            double med = local.get(local.size() / 2);
-            if (Math.abs(rad[i] - med) > spikeTol) spike[i] = true;
+            // nearest accepted neighbour before and after i along the ordering
+            int prev = i, fwd = i, bs = 0, fs = 0;
+            do { prev = (prev - 1 + n) % n; bs++; } while (!ok[prev] && bs < n);
+            do { fwd = (fwd + 1) % n; fs++; } while (!ok[fwd] && fs < n);
+            if (prev == i || fwd == i || prev == fwd) continue;   // not enough context
+            double ax = px[prev], ay = py[prev], bx = px[fwd], by = py[fwd];
+            double vx = bx - ax, vy = by - ay;
+            double vlen = Math.hypot(vx, vy);
+            if (vlen < 1e-9) continue;
+            // perpendicular distance from point i to the chord prev->fwd
+            double perp = Math.abs((px[i] - ax) * vy - (py[i] - ay) * vx) / vlen;
+            if (perp > spikeTol) spike[i] = true;
         }
         for (int i = 0; i < n; i++) if (spike[i]) ok[i] = false;   // demote spikes to gaps
 
