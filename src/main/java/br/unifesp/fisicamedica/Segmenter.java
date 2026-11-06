@@ -384,8 +384,10 @@ public class Segmenter {
         // PAE normals collected in lockstep with finalSubpixelPolygon points (Option A).
         List<double[]> finalNormals = new ArrayList<>();
 
-        if (Boolean.getBoolean("ttf.paePrimary")) {
-            // ---- Option C: build the polygon from the PAE edge points directly ----
+        String edgeStrategy = edgeStrategy();
+
+        if ("primary".equals(edgeStrategy)) {
+            // ---- Strategy C: build the polygon from the PAE edge points directly ----
             // The PAE edge list IS the sub-pixel edge; it is gap-free wherever a true
             // edge exists. Rather than walk the wand and snap-or-drop (which creates
             // holes), we keep every PAE point that belongs to this insert's edge,
@@ -395,14 +397,18 @@ public class Segmenter {
             // centroid in CROP coordinates (PAE edges and wand are crop-relative)
             buildPolygonFromPae(paeResult, cleanWand, centerX - rx, centerY - ry, rx, ry,
                     finalSubpixelPolygon, finalNormals);
-        } else if (Boolean.getBoolean("ttf.paeFill") && cleanWand.npoints > 0) {
-            // ---- Option B: hole-FREE wand anchoring with spike guard + smoothing ----
+        } else if ("fill".equals(edgeStrategy) && cleanWand.npoints > 0) {
+            // ---- Strategy B (DEFAULT): hole-free wand anchoring + spike guard + smoothing ----
             // Keeps the wand-anchored geometry but eliminates holes at the source:
             // a wider match tolerance fills most gaps, a shape/deviation test rejects
             // spurious "spike" matches, genuine gaps are bridged by interpolation
             // (never by a bad snap), and the contour is lightly smoothed at the end.
+            // Validated as the most robust across SOFT and LUNG at all noise levels.
             buildPolygonFilled(paeResult, cleanWand, rx, ry, finalSubpixelPolygon, finalNormals);
-        } else if (cleanWand.npoints > 0) {
+        } else if (("legacy".equals(edgeStrategy) || "normals".equals(edgeStrategy)) && cleanWand.npoints > 0) {
+            // ---- Strategy A ("normals") / legacy: wand snap-or-drop polygon. ----
+            // "legacy" uses neighbour-fit normals in the ESF step; "normals" (A) uses
+            // the per-point PAE normals collected here. Both can leave holes.
             List<Point> denseWand = new ArrayList<>();
             for (int i = 0; i < cleanWand.npoints; i++) {
                 int x1 = cleanWand.xpoints[i];
@@ -758,6 +764,37 @@ public class Segmenter {
             outNormals.add(new double[]{ pnx[i], pny[i] });
             EdgeDiagnostics.recordAnchor(false);   // hole-free by construction
         }
+    }
+
+    /**
+     * Edge-polygon construction strategy. Default is "fill" (Strategy B): hole-free
+     * wand anchoring with spike guard + smoothing, validated as the most robust
+     * across SOFT and LUNG at all noise levels.
+     *
+     * Selection (first match wins):
+     *   -Dttf.edgeStrategy=legacy|normals|fill|primary   explicit override
+     *   -Dttf.paePrimary=true   -> "primary"  (Strategy C, back-compat toggle)
+     *   -Dttf.paeFill=true      -> "fill"     (Strategy B, back-compat toggle)
+     *   -Dttf.paeNormals=true   -> "normals"  (Strategy A, back-compat toggle)
+     *   (nothing set)           -> "fill"     (new default)
+     *
+     *   legacy  : wand snap-or-drop polygon + neighbour-fit normals (pre-change behavior)
+     *   normals : wand snap-or-drop polygon + per-point PAE normals (Strategy A)
+     *   fill    : hole-free wand polygon (Strategy B) [DEFAULT]
+     *   primary : polygon from PAE points directly (Strategy C)
+     */
+    static String edgeStrategy() {
+        String s = System.getProperty("ttf.edgeStrategy");
+        if (s != null) {
+            s = s.trim().toLowerCase();
+            if (s.equals("legacy") || s.equals("normals") || s.equals("fill") || s.equals("primary")) {
+                return s;
+            }
+        }
+        if (Boolean.getBoolean("ttf.paePrimary")) return "primary";
+        if (Boolean.getBoolean("ttf.paeFill"))    return "fill";
+        if (Boolean.getBoolean("ttf.paeNormals"))  return "normals";
+        return "fill";   // Strategy B is the default
     }
 
     private static double getDoubleProp(String key, double def) {

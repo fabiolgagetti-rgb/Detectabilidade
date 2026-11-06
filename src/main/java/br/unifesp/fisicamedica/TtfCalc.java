@@ -190,8 +190,10 @@ public class TtfCalc {
         // Option C (ttf.paePrimary) builds the polygon from PAE points and implies
         // using their analytic per-point normals; Option A (ttf.paeNormals) enables
         // the same normal use on the legacy wand-anchored polygon.
-        boolean usePaeNormals = (Boolean.getBoolean("ttf.paeNormals") || Boolean.getBoolean("ttf.paePrimary")
-                || Boolean.getBoolean("ttf.paeFill"))
+        // Use the per-point PAE normals for every strategy except "legacy"
+        // (which keeps the neighbour-fit). Strategy is resolved in one place
+        // (Segmenter.edgeStrategy); default is "fill" (Strategy B).
+        boolean usePaeNormals = !"legacy".equals(Segmenter.edgeStrategy())
                 && pointNormals != null && pointNormals.length == boundary.npoints;
 
         // Optional smoothing of the PAE normals along the edge ordering. PAE normals
