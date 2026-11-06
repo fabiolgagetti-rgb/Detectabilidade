@@ -36,6 +36,15 @@ public class Segmenter {
 	    List<List<Double>> meanI0 = new ArrayList<>();
 	    List<List<Double>> meanI1 = new ArrayList<>();
 
+	    // Per-structure contrast / noise / CNR, aligned with 'roi' (one entry per
+	    // accepted structure). Registered at detection time for reporting in the UI.
+	    //   contrast : full edge step height (HU-calibrated units of the image)
+	    //   noise    : std-dev of the background band just outside the shape
+	    //   cnr      : contrast / noise
+	    public List<Double> contrast = new ArrayList<>();
+	    public List<Double> noise = new ArrayList<>();
+	    public List<Double> cnr = new ArrayList<>();
+
 	    // Option A (PAE edge normals), unit normals [nPoints][2] aligned 1:1 with the
 	    // final ROI polygon points, taken directly from the partial-area detector.
 	    // Lets the ESF step use each point's own analytic normal instead of a
@@ -78,6 +87,55 @@ public class Segmenter {
         if (!(cnr > 0) || Double.isInfinite(cnr)) return 0.4;
         double s = 2.0 - 0.75 * Math.log10(cnr);
         return Math.max(0.4, Math.min(1.6, s));
+    }
+
+    /**
+     * Estimate image noise from a thin band JUST OUTSIDE the detected shape.
+     *
+     * Builds band = enlarge(shape, +bandPx) minus the shape interior, and returns
+     * the std-dev of the ORIGINAL image there. This region is background (truly
+     * homogeneous), so it reflects genuine image noise and is immune to internal
+     * structures inside the object (which would otherwise inflate an interior-based
+     * std and over-blur the edge). Falls back to the shrunk-interior std if the
+     * outside band is empty or touches the image border badly.
+     */
+    private static double noiseOutsideShape(ImageProcessor origIp, Roi shape) {
+        try {
+            // Leave a GAP beyond the shape so the band clears the (blurred) edge
+            // transition entirely, then take a band of width 'bandPx' past the gap.
+            int gapPx = 6;      // clears the edge + its blur
+            int bandPx = 8;     // thickness of the pure-background sampling band
+            Roi inner = RoiEnlarger.enlarge(shape, gapPx);
+            Roi outer = RoiEnlarger.enlarge(shape, gapPx + bandPx);
+            ByteProcessor bandMask = new ByteProcessor(origIp.getWidth(), origIp.getHeight());
+            bandMask.setColor(255);
+            bandMask.fill(outer);
+            bandMask.setColor(0);
+            bandMask.fill(inner);                 // carve out shape+gap -> only the far band remains
+
+            double sum = 0, sum2 = 0; long n = 0;
+            for (int y = 0; y < origIp.getHeight(); y++) {
+                for (int x = 0; x < origIp.getWidth(); x++) {
+                    if (bandMask.get(x, y) != 0) {
+                        double v = origIp.getf(x, y);
+                        sum += v; sum2 += v * v; n++;
+                    }
+                }
+            }
+            if (n >= 20) {
+                double mean = sum / n;
+                double var = sum2 / n - mean * mean;
+                if (var > 0) return Math.sqrt(var);
+            }
+        } catch (Exception ignore) {
+            // fall through to interior fallback
+        }
+        // Fallback: previous behavior (shrunk interior std) if the outside band failed.
+        Roi noiseRoi = RoiEnlarger.enlarge(shape, -5);
+        origIp.setRoi(noiseRoi);
+        double sd = origIp.getStatistics().stdDev;
+        origIp.resetRoi();
+        return sd;
     }
 
     public static DetectorResult edgeFinder(ImageStack stack, Calibration cal, Roi userRoi, boolean isAuto, boolean avgSlices) {
@@ -312,22 +370,18 @@ public class Segmenter {
         //
         // contrast: full step height. thresholdForEdge sits mid-edge, so
         //           |mode - thresholdForEdge| is ~ half the contrast.
-        // noise:    std-dev of intensities inside the wand ROI (sufficient per
-        //           design; measured on the ORIGINAL image, not the sigma=1 blur).
+        // noise:    std-dev of a thin band JUST OUTSIDE the detected shape. The
+        //           previous estimate used the whole wand-ROI INTERIOR, which for
+        //           objects with internal structure (e.g. a bone-marrow disk inside
+        //           a vertebra) counts that structure's step as "noise": the std-dev
+        //           inflates, CNR collapses, and the adaptive pre-blur over-smooths
+        //           the edge -> the measured MTF droops. The region just outside the
+        //           shape is genuinely homogeneous (background), so it isolates true
+        //           image noise regardless of what is inside the object.
         // ------------------------------------------------------------------
         double contrast = 2.0 * Math.abs(mode - thresholdForEdge);
 
-     // Reduz a ROI em 5 pixels em todas as direções
-        Roi noiseRoi = RoiEnlarger.enlarge(wandRoi, -5);
-
-        // Aplica a ROI reduzida
-        origIp.setRoi(noiseRoi);
-
-        ImageStatistics noiseStats = origIp.getStatistics();
-
-        double noise = noiseStats.stdDev;
-        origIp.resetRoi();
-
+        double noise = noiseOutsideShape(origIp, wandRoi);
         double cnr = noise > 0 ? contrast / noise : Double.POSITIVE_INFINITY;
         double blurSigma = blurSigmaForCNR(cnr);
 
@@ -536,7 +590,6 @@ public class Segmenter {
             EdgeDiagnostics.record(EdgeDiagnostics.Reason.CONTRAST_GATE);
             return;
         }
-
         EdgeDiagnostics.record(EdgeDiagnostics.Reason.ACCEPTED);
 
         dR.modeContrast.add(expectedContrasts);
@@ -552,6 +605,11 @@ public class Segmenter {
 
         dR.roi.add(finalRoi);
         dR.edgeNormalsPerRoi.add(finalNormals.toArray(new double[0][]));
+
+        // Register per-structure contrast/noise/CNR for later UI display.
+        dR.contrast.add(contrast);
+        dR.noise.add(noise);
+        dR.cnr.add(cnr);
 
         dR.Pos.add(new Point((int)Math.round(centerX), (int)Math.round(centerY)));
 

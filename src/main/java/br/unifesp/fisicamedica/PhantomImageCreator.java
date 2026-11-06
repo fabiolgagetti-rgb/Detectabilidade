@@ -142,6 +142,122 @@ public class PhantomImageCreator {
     }
 
     /**
+     * Creates an anthropomorphic spine/marrow test phantom and runs it through the
+     * same MTF + textured-noise pipeline as the circular-insert phantom.
+     *
+     * Geometry (concentric about the image centre), per the reference object:
+     *   - marrow: solid circle, diameter {@code marrowDiamMM} (default 20.5 mm), {@code marrowHU} (200).
+     *   - vertebra: ring enclosing the marrow, inner diameter = marrow diameter,
+     *     outer diameter {@code ringOuterDiamMM} (24 mm), {@code boneHU} (600).
+     *   - wings: a wide isosceles triangle below the marrow, base {@code triBaseMM} (50 mm)
+     *     centred horizontally with its base {@code triBaseBelowMM} (17.7 mm) below the
+     *     marrow centre, and base angle {@code triBaseAngleDeg} (23 deg) between each
+     *     slanted side and the base. Same HU as bone.
+     *
+     * All structures are rendered with NxN sub-pixel supersampling so the edges
+     * (especially the triangle's diagonals) are anti-aliased, giving a clean ESF.
+     *
+     * @return single-slice ImagePlus (one inserts slice), calibrated in HU.
+     */
+    public ImagePlus criarImagemCTPhantomSpine(
+            int matriz, double fov, double bgHU, double marrowHU, double boneHU,
+            double marrowDiamMM, double ringOuterDiamMM,
+            double triBaseMM, double triBaseBelowMM, double triBaseAngleDeg,
+            String kernelName, double variance) {
+
+        ImageStack stack = new ImageStack(matriz, matriz);
+        double bg = bgHU + 8192;
+        double marrow = marrowHU + 8192;
+        double bone = boneHU + 8192;
+
+        double pixelSize = fov / matriz;
+        double cxPx = matriz / 2.0;
+        double cyPx = matriz / 2.0;
+
+        Calibration cal = new Calibration();
+        cal.setUnit("mm");
+        cal.pixelWidth = pixelSize;
+        cal.pixelHeight = pixelSize;
+        cal.pixelDepth = 1.0;
+        cal.setValueUnit("HU");
+        cal.setFunction(Calibration.STRAIGHT_LINE, new double[]{-8192, 1}, "mm");
+
+        MTFModel mtfModel = new MTFModel();
+        double[][] mtfParams = MTFModel.getMTFparameters(kernelName);
+        double[][] mtf2D = mtfModel.gerarMTF2D(matriz, matriz, cal, mtfParams);
+        NPSModel npsModel = new NPSModel();
+        double[] npsParams = NPSModel.getNPSCoefficients(kernelName);
+        double[][] nps2D = npsModel.gerarNPS2D(matriz, matriz, cal, npsParams, variance);
+
+        // ---- geometry in pixels (y increases downward; "below" = +y) ----
+        double marrowR = (marrowDiamMM / 2.0) / pixelSize;
+        double ringOuterR = (ringOuterDiamMM / 2.0) / pixelSize;
+        double halfBase = (triBaseMM / 2.0) / pixelSize;
+        double baseY = cyPx + (triBaseBelowMM / pixelSize);           // base line (bottom of wings)
+        double apexRise = halfBase * Math.tan(Math.toRadians(triBaseAngleDeg));
+        double apexY = baseY - apexRise;                              // top vertex of the triangle
+        // triangle vertices: left/right base corners and top apex (centred on x)
+        double axL = cxPx - halfBase, axR = cxPx + halfBase;
+        double apex = cxPx;
+
+        FloatProcessor ideal = new FloatProcessor(matriz, matriz);
+        final int SS = 4;                 // sub-pixel supersampling per axis
+        final double inv = 1.0 / SS;
+
+        for (int y = 0; y < matriz; y++) {
+            for (int x = 0; x < matriz; x++) {
+                int marrowHits = 0, boneHits = 0, total = SS * SS;
+                for (int sy = 0; sy < SS; sy++) {
+                    for (int sx = 0; sx < SS; sx++) {
+                        double px = x + (sx + 0.5) * inv - 0.5;
+                        double py = y + (sy + 0.5) * inv - 0.5;
+                        double dx = px - cxPx, dy = py - cyPx;
+                        double r = Math.hypot(dx, dy);
+                        boolean inTri = pointInTriangle(px, py, axL, baseY, axR, baseY, apex, apexY);
+                        if (r <= marrowR) {
+                            marrowHits++;                       // marrow interior
+                        } else if (r <= ringOuterR || inTri) {
+                            boneHits++;                         // vertebra ring or wings
+                        }
+                    }
+                }
+                double val;
+                if (marrowHits == 0 && boneHits == 0) {
+                    val = bg;
+                } else {
+                    // coverage-weighted blend (bone takes precedence where it overlaps)
+                    double fBone = boneHits / (double) total;
+                    double fMarrow = marrowHits / (double) total;
+                    double fBg = 1.0 - fBone - fMarrow;
+                    if (fBg < 0) fBg = 0;
+                    val = fBone * bone + fMarrow * marrow + fBg * bg;
+                }
+                ideal.putPixelValue(x, y, val);
+            }
+        }
+
+        ImageProcessor ipMtf = MTFModel.applyMTF(ideal, mtf2D);
+        ImageProcessor ipRuido = npsModel.texturedNoiseIP(nps2D, pixelSize);
+        FloatProcessor sliceFim = adicionarRuido(ipMtf, ipRuido);
+        stack.addSlice(criarFatiaShortUnscaled(sliceFim));
+
+        ImagePlus imp = new ImagePlus("SpinePhantom_" + kernelName, stack);
+        imp.setCalibration(cal);
+        return imp;
+    }
+
+    /** Barycentric point-in-triangle test. */
+    private static boolean pointInTriangle(double px, double py,
+            double x1, double y1, double x2, double y2, double x3, double y3) {
+        double d = (y2 - y3) * (x1 - x3) + (x3 - x2) * (y1 - y3);
+        if (d == 0) return false;
+        double a = ((y2 - y3) * (px - x3) + (x3 - x2) * (py - y3)) / d;
+        double b = ((y3 - y1) * (px - x3) + (x1 - x3) * (py - y3)) / d;
+        double c = 1 - a - b;
+        return a >= 0 && b >= 0 && c >= 0;
+    }
+
+    /**
      * Soma uma imagem determinística (fundo) a uma imagem estocástica (ruído)
      */
     private static FloatProcessor adicionarRuido(ImageProcessor base, ImageProcessor ruido) {
