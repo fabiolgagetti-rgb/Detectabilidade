@@ -40,9 +40,30 @@ public final class EdgeDiagnostics {
     public static void disable() { enabled = false; }
     public static boolean isEnabled() { return enabled; }
 
+    // Edge-anchoring hole accounting: how many densified wand points found no PAE
+    // edge within the match tolerance (holes) vs the total considered. Populated by
+    // processRecord's anchoring loop when enabled; no-op otherwise.
+    private static long anchorTotal = 0;
+    private static long anchorHoles = 0;
+
     public static synchronized void reset() {
         counts.clear();
         lastReason = null;
+        anchorTotal = 0;
+        anchorHoles = 0;
+    }
+
+    /** Record one anchoring attempt: hole=true if no PAE edge matched within tolerance. */
+    public static synchronized void recordAnchor(boolean hole) {
+        if (!enabled) return;
+        anchorTotal++;
+        if (hole) anchorHoles++;
+    }
+
+    public static synchronized long anchorTotal() { return anchorTotal; }
+    public static synchronized long anchorHoles() { return anchorHoles; }
+    public static synchronized double anchorHoleFraction() {
+        return anchorTotal > 0 ? (double) anchorHoles / anchorTotal : 0.0;
     }
 
     /** Called at each decision point in processRecord. No-op unless enabled. */
